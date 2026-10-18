@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, epic/8056-modules-wiring]
   workflow_dispatch:
 
 jobs:
