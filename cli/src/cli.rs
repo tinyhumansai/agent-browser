@@ -3,7 +3,7 @@
 
 use crate::{
     ca_bundle, chat, color, commands, connection, doctor, flags, install, mcp, native, output,
-    plugins, skills, upgrade, validation,
+    plugins, skills, tls, upgrade, validation,
 };
 
 use serde_json::json;
@@ -25,7 +25,7 @@ use connection::{
     cleanup_stale_files, daemon_unreachable, ensure_daemon, get_socket_dir, is_pid_alive,
     send_command, walk_daemons, DaemonOptions, Response,
 };
-use flags::{clean_args, parse_flags, Flags};
+use flags::{clean_args, parse_flags, split_launch_args, Flags};
 use install::run_install;
 use output::{
     print_command_help, print_help, print_response_with_opts, print_version, OutputOptions,
@@ -47,6 +47,19 @@ fn print_json_error(message: impl AsRef<str>) {
         "success": false,
         "error": message.as_ref(),
     }));
+}
+
+/// Like print_json_error, but keeps a machine-readable code such as
+/// `outcome_unknown` from a failed daemon response.
+fn print_json_error_with_code(message: impl AsRef<str>, code: Option<&str>) {
+    let mut value = json!({
+        "success": false,
+        "error": message.as_ref(),
+    });
+    if let Some(code) = code {
+        value["code"] = json!(code);
+    }
+    print_json_value(value);
 }
 
 fn print_json_error_with_type(message: impl AsRef<str>, error_type: &str) {
@@ -122,6 +135,35 @@ fn command_is_external_launch(cmd: &serde_json::Value) -> bool {
                 .get("autoConnect")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false))
+}
+
+/// Commands that make their own HTTPS requests and never need a browser
+/// launch. `--ca-cert` applies only to CLI trust for these. A `batch` given
+/// as arguments counts when every command in it is one of these.
+fn command_is_browserless(cmd: &serde_json::Value) -> bool {
+    match cmd.get("action").and_then(|value| value.as_str()) {
+        Some("read") => true,
+        Some("batch") => {
+            let first_words: Vec<Option<String>> =
+                if let Some(argv) = cmd.get("argv").and_then(|v| v.as_array()) {
+                    argv.iter()
+                        .map(|c| c.get(0).and_then(|w| w.as_str()).map(str::to_string))
+                        .collect()
+                } else if let Some(commands) = cmd.get("commands").and_then(|v| v.as_array()) {
+                    commands
+                        .iter()
+                        .map(|c| {
+                            c.as_str()
+                                .and_then(|c| commands::shell_words_split(c).into_iter().next())
+                        })
+                        .collect()
+                } else {
+                    return false;
+                };
+            !first_words.is_empty() && first_words.iter().all(|w| w.as_deref() == Some("read"))
+        }
+        _ => false,
+    }
 }
 
 fn build_provider_launch_command(provider: &str, flags: &Flags) -> serde_json::Value {
@@ -230,7 +272,7 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
         return Some("--ca-cert is supported only with the Chrome engine on Linux");
     }
     if flags.ca_cert.is_some() && !cfg!(target_os = "linux") {
-        return Some("--ca-cert is currently supported only on Linux");
+        return Some("--ca-cert browser trust is currently supported only on Linux (read, install, upgrade, and doctor accept it on every platform)");
     }
 
     None
@@ -245,8 +287,7 @@ fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -
         || flags.proxy.is_some()
         || flags.args.is_some()
         || flags.user_agent.is_some()
-        || flags.ca_cert.is_some()
-        || flags.clear_ca_cert
+        || ((flags.ca_cert.is_some() || flags.clear_ca_cert) && !command_is_browserless(command))
         || flags.allow_file_access
         || should_send_hide_scrollbars_launch_option(
             flags.cli_hide_scrollbars,
@@ -267,6 +308,13 @@ fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -
         && flags.provider.is_none()
         && !flags.auto_connect
         && !command_is_external_launch(command)
+}
+
+/// Sends this invocation's resolved Obscura bypass setting, including an explicit clear.
+fn attach_obscura_proxy_bypass(cmd: &mut serde_json::Value, flags: &Flags) {
+    if flags.engine.as_deref() == Some("obscura") {
+        cmd["proxyBypass"] = json!(flags.proxy_bypass);
+    }
 }
 
 fn attach_restore_config_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
@@ -1263,8 +1311,20 @@ fn run_close_all(flags: &Flags) {
 
     for (session, pid) in &sessions {
         let cmd = json!({ "id": gen_id(), "action": "close" });
-        match send_command(cmd, session) {
-            Ok(resp) if resp.success => closed.push(session.clone()),
+        // A close whose response was lost leaves the daemon in an unknown
+        // state; force-kill it like an unreachable one.
+        let result = send_command(cmd, session).and_then(|resp| {
+            if resp.code.as_deref() == Some("outcome_unknown") {
+                Err(resp.error.unwrap_or_default())
+            } else {
+                Ok(resp)
+            }
+        });
+        match result {
+            Ok(resp) if resp.success => {
+                tls::clear_session(session);
+                closed.push(session.clone());
+            }
             Ok(resp) => {
                 let err = resp.error.unwrap_or_else(|| "Unknown error".to_string());
                 failed.push((session.clone(), err));
@@ -1366,6 +1426,7 @@ pub fn main() {
         env::set_var("AGENT_BROWSER_NAMESPACE", namespace);
     }
     let clean = clean_args(&args);
+    tls::configure_process(&flags);
 
     let has_help = args.iter().any(|a| a == "--help" || a == "-h");
     let has_version = args.iter().any(|a| a == "--version" || a == "-V");
@@ -1546,6 +1607,17 @@ pub fn main() {
         }
     };
     attach_input_mode(&mut cmd, &flags);
+    // Stdin batches are read before launch decisions so a batch of `read`
+    // commands is recognized as browserless, like one given as arguments.
+    if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") && cmd.get("commands").is_none()
+    {
+        cmd["argv"] = json!(read_batch_stdin(&flags));
+    }
+    match cmd.get("action").and_then(|v| v.as_str()) {
+        Some("read") => cmd["tls"] = json!(tls::session_options(&flags, &flags.session)),
+        Some("close") => tls::clear_session(&flags.session),
+        _ => {}
+    }
     // Handle --password-stdin for auth save
     if cmd.get("action").and_then(|v| v.as_str()) == Some("auth_save") {
         if cmd.get("password").is_some() {
@@ -1642,7 +1714,17 @@ pub fn main() {
         return;
     }
 
-    if let Some(msg) = incompatible_launch_mode_error(&flags) {
+    let launch_mode_error = if command_is_browserless(&cmd) {
+        let ca_cert = flags.ca_cert.take();
+        let clear_ca_cert = std::mem::take(&mut flags.clear_ca_cert);
+        let error = incompatible_launch_mode_error(&flags);
+        flags.ca_cert = ca_cert;
+        flags.clear_ca_cert = clear_ca_cert;
+        error
+    } else {
+        incompatible_launch_mode_error(&flags)
+    };
+    if let Some(msg) = launch_mode_error {
         if flags.json {
             print_json_error(msg);
         } else {
@@ -1761,16 +1843,17 @@ pub fn main() {
 
         let err = match send_command(launch_cmd, &flags.session) {
             Ok(resp) if resp.success => None,
-            Ok(resp) => Some(
+            Ok(resp) => Some((
                 resp.error
                     .unwrap_or_else(|| "Auto-connect failed".to_string()),
-            ),
-            Err(e) => Some(e.to_string()),
+                resp.code,
+            )),
+            Err(e) => Some((e.to_string(), None)),
         };
 
-        if let Some(msg) = err {
+        if let Some((msg, code)) = err {
             if flags.json {
-                print_json_error(msg);
+                print_json_error_with_code(msg, code.as_deref());
             } else {
                 eprintln!("{} {}", color::error_indicator(), msg);
             }
@@ -1862,16 +1945,17 @@ pub fn main() {
 
         let err = match send_command(launch_cmd, &flags.session) {
             Ok(resp) if resp.success => None,
-            Ok(resp) => Some(
+            Ok(resp) => Some((
                 resp.error
                     .unwrap_or_else(|| "CDP connection failed".to_string()),
-            ),
-            Err(e) => Some(e.to_string()),
+                resp.code,
+            )),
+            Err(e) => Some((e.to_string(), None)),
         };
 
-        if let Some(msg) = err {
+        if let Some((msg, code)) = err {
             if flags.json {
-                print_json_error(msg);
+                print_json_error_with_code(msg, code.as_deref());
             } else {
                 eprintln!("{} {}", color::error_indicator(), msg);
             }
@@ -1885,16 +1969,17 @@ pub fn main() {
 
         let err = match send_command(launch_cmd, &flags.session) {
             Ok(resp) if resp.success => None,
-            Ok(resp) => Some(
+            Ok(resp) => Some((
                 resp.error
                     .unwrap_or_else(|| "Provider connection failed".to_string()),
-            ),
-            Err(e) => Some(e.to_string()),
+                resp.code,
+            )),
+            Err(e) => Some((e.to_string(), None)),
         };
 
-        if let Some(msg) = err {
+        if let Some((msg, code)) = err {
             if flags.json {
-                print_json_error(msg);
+                print_json_error_with_code(msg, code.as_deref());
             } else {
                 eprintln!("{} {}", color::error_indicator(), msg);
             }
@@ -1959,13 +2044,7 @@ pub fn main() {
         }
 
         if let Some(ref a) = flags.args {
-            // Parse args (comma or newline separated)
-            let args_vec: Vec<String> = a
-                .split(&[',', '\n'][..])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            cmd_obj.insert("args".to_string(), json!(args_vec));
+            cmd_obj.insert("args".to_string(), json!(split_launch_args(a)));
         }
 
         if !flags.extensions.is_empty() {
@@ -2020,6 +2099,7 @@ pub fn main() {
         if let Some(ref engine) = flags.engine {
             launch_cmd["engine"] = json!(engine);
         }
+        attach_obscura_proxy_bypass(&mut launch_cmd, &flags);
 
         match send_command(launch_cmd, &flags.session) {
             Ok(resp) if !resp.success => {
@@ -2028,7 +2108,7 @@ pub fn main() {
                     .error
                     .unwrap_or_else(|| "Browser launch failed".to_string());
                 if flags.json {
-                    print_json_error(error_msg);
+                    print_json_error_with_code(error_msg, resp.code.as_deref());
                 } else {
                     eprintln!("{} {}", color::error_indicator(), error_msg);
                 }
@@ -2055,12 +2135,16 @@ pub fn main() {
     // Handle batch command: from args or stdin
     if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
         let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
-        let arg_commands = cmd.get("commands").and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(commands::shell_words_split)
-                .collect::<Vec<Vec<String>>>()
-        });
+        let arg_commands = cmd
+            .get("commands")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(commands::shell_words_split)
+                    .collect::<Vec<Vec<String>>>()
+            })
+            .or_else(|| serde_json::from_value(cmd.get("argv")?.clone()).ok());
         run_batch(&flags, &daemon_opts, bail, arg_commands);
         return;
     }
@@ -2120,46 +2204,47 @@ fn send_command_with_respawn(
     }
 }
 
+/// Read batch commands given on stdin as a JSON array of string arrays.
+fn read_batch_stdin(flags: &Flags) -> Vec<Vec<String>> {
+    use std::io::Read as _;
+
+    let mut input = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+        if flags.json {
+            print_json_error(format!("Failed to read stdin: {}", e));
+        } else {
+            eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
+        }
+        exit(1);
+    }
+
+    match serde_json::from_str(&input) {
+        Ok(c) => c,
+        Err(e) => {
+            if flags.json {
+                print_json_error(format!(
+                    "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
+                    e
+                ));
+            } else {
+                eprintln!(
+                    "{} Invalid JSON input: {}. Expected an array of string arrays.",
+                    color::error_indicator(),
+                    e
+                );
+            }
+            exit(1);
+        }
+    }
+}
+
 fn run_batch(
     flags: &Flags,
     daemon_opts: &DaemonOptions,
     bail: bool,
     arg_commands: Option<Vec<Vec<String>>>,
 ) {
-    let commands: Vec<Vec<String>> = if let Some(cmds) = arg_commands {
-        cmds
-    } else {
-        use std::io::Read as _;
-
-        let mut input = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut input) {
-            if flags.json {
-                print_json_error(format!("Failed to read stdin: {}", e));
-            } else {
-                eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
-            }
-            exit(1);
-        }
-
-        match serde_json::from_str(&input) {
-            Ok(c) => c,
-            Err(e) => {
-                if flags.json {
-                    print_json_error(format!(
-                        "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
-                        e
-                    ));
-                } else {
-                    eprintln!(
-                        "{} Invalid JSON input: {}. Expected an array of string arrays.",
-                        color::error_indicator(),
-                        e
-                    );
-                }
-                exit(1);
-            }
-        }
-    };
+    let commands: Vec<Vec<String>> = arg_commands.unwrap_or_else(|| read_batch_stdin(flags));
 
     if commands.is_empty() {
         if flags.json {
@@ -2206,6 +2291,11 @@ fn run_batch(
             }
         };
         attach_input_mode(&mut parsed, flags);
+        match parsed.get("action").and_then(|v| v.as_str()) {
+            Some("read") => parsed["tls"] = json!(tls::session_options(flags, &flags.session)),
+            Some("close") => tls::clear_session(&flags.session),
+            _ => {}
+        }
 
         let action = parsed
             .get("action")
@@ -2917,7 +3007,7 @@ mod tests {
 
         let error = incompatible_launch_mode_error(&flags);
         assert!(
-            error.is_none() || error == Some("--ca-cert is currently supported only on Linux"),
+            error.is_none() || error == Some("--ca-cert browser trust is currently supported only on Linux (read, install, upgrade, and doctor accept it on every platform)"),
             "README proxy CA configuration is incompatible: {error:?}"
         );
     }

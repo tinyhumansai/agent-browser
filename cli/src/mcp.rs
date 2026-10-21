@@ -836,7 +836,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_SNAPSHOT,
             "Snapshot page",
-            "Return an accessibility-tree snapshot with reusable element refs.",
+            "Return an accessibility-tree snapshot with reusable element refs. If an action reports that a stale ref cannot be recovered, take a new snapshot and use a fresh ref.",
             json!({
                 "interactive": { "type": "boolean", "default": true, "description": "Only include interactive elements." },
                 "compact": { "type": "boolean", "default": false, "description": "Remove empty structural elements." },
@@ -1504,7 +1504,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_AUTH_LOGIN,
             "Auth login",
-            "Log in with a saved auth profile.",
+            "Log in with a saved auth profile. Control selection checks layout size, computed visibility and opacity, and disabled/readonly state. Replaced or focus-redirected credential fields fail without submitting.",
             json!({
                 "name": { "type": "string" },
                 "noNavigate": {
@@ -1719,7 +1719,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_CONNECT,
             "Connect CDP",
-            "Connect to a browser over CDP. With pinTab, the session is strictly bound to its own tab: it re-binds by target id after restarts and fails with a tab_gone error instead of adopting another tab. Structured errors include code=tab_gone, data.targetId, and optional sanitized data.lastUrl. Pass pinTab: false to explicitly disable a sticky pin; omit it to keep the current state.",
+            "Connect to a browser over CDP. With pinTab, the session is strictly bound to its own tab: it re-binds by target id after restarts and fails with a tab_gone error instead of adopting another tab. Structured errors include code=tab_gone, data.targetId, and optional sanitized data.lastUrl. Pass pinTab: false to explicitly disable a sticky pin; omit it to keep the current state. The session stays attached until agent_browser_close, so later tools without a connection target use the same browser.",
             json!({
                 "target": { "type": "string", "description": "CDP port or URL." },
                 "pinTab": { "type": "boolean", "description": "Strict session-to-tab binding (sticky for the session). Explicit false disables a sticky pin; omitted leaves it unchanged." }
@@ -2020,7 +2020,14 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         "caCert".to_string(),
         json!({
             "type": "string",
-            "description": "Path to a CA certificate or PEM bundle trusted by a locally launched Chromium browser on Linux."
+            "description": "Path to a CA certificate or PEM bundle. Trusted by the CLI's own HTTPS requests (read, install, upgrade, doctor), and by a locally launched Chromium browser on Linux."
+        }),
+    );
+    props.insert(
+        "useSystemCa".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "Use the operating system trust store instead of the built-in roots for the CLI's own HTTPS requests. Does not affect the browser."
         }),
     );
     props.insert(
@@ -2042,7 +2049,7 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         json!({
             "type": "array",
             "items": { "type": "string" },
-            "description": "Advanced: extra CLI arguments for this command, preserving full CLI parity."
+            "description": "Advanced: extra CLI arguments, including --engine chrome|lightpanda|obscura and --executable-path, preserving full CLI parity. Obscura is experimental and rejects --proxy-bypass (including resolved config/environment settings). Explicit Obscura launches send this invocation's resolved bypass setting even to an existing daemon."
         }),
     );
     props.insert(
@@ -2156,10 +2163,57 @@ fn is_open_world_tool(name: &str) -> bool {
     )
 }
 
-fn is_known_tool(name: &str) -> bool {
+fn find_tool(name: &str) -> Option<Value> {
     tools()
-        .iter()
-        .any(|tool| tool.get("name").and_then(|v| v.as_str()) == Some(name))
+        .into_iter()
+        .find(|tool| tool.get("name").and_then(|v| v.as_str()) == Some(name))
+}
+
+/// Returns an error naming any argument keys the tool's input schema does not declare.
+fn reject_unknown_arguments(
+    name: &str,
+    definition: &Value,
+    arguments: &Value,
+) -> Result<(), ProtocolError> {
+    let Some(args) = arguments.as_object() else {
+        return Ok(());
+    };
+    let empty = serde_json::Map::new();
+    let declared = definition
+        .pointer("/inputSchema/properties")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
+    let mut unknown: Vec<&str> = args
+        .keys()
+        .filter(|key| !declared.contains_key(*key))
+        .map(|key| key.as_str())
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    let shared = tool("", "", "", json!({}), &[]);
+    let shared_keys = shared
+        .pointer("/inputSchema/properties")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
+    let mut own: Vec<&str> = declared
+        .keys()
+        .filter(|key| !shared_keys.contains_key(*key))
+        .map(|key| key.as_str())
+        .collect();
+    own.sort();
+    let own = if own.is_empty() {
+        "none".to_string()
+    } else {
+        own.join(", ")
+    };
+    Err(ProtocolError::invalid_params(format!(
+        "Unknown argument(s) for {}: {}. Tool arguments: {}.",
+        name,
+        unknown.join(", "),
+        own
+    )))
 }
 
 fn wait_tool(
@@ -2191,12 +2245,12 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         .ok_or_else(|| ProtocolError::invalid_params("tools/call params.name must be a string"))?;
     let arguments = params.get("arguments").unwrap_or(&Value::Null);
 
-    if !is_known_tool(name) {
+    let Some(tool_def) = find_tool(name) else {
         return Err(ProtocolError::invalid_params(format!(
             "Unknown tool: {}",
             name
         )));
-    }
+    };
 
     if !config.allows(name) {
         return Err(ProtocolError::invalid_params(format!(
@@ -2205,6 +2259,8 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
             config.profile_names().join(", ")
         )));
     }
+
+    reject_unknown_arguments(name, &tool_def, arguments)?;
 
     match name {
         TOOL_TOOLS_PROFILES => call_tools_profiles(config),
@@ -3878,6 +3934,10 @@ fn append_common_global_args(
     } else if clear_ca_cert {
         args.push("--no-ca-cert".to_string());
     }
+    if let Some(use_system_ca) = optional_bool(arguments, "useSystemCa")? {
+        args.push("--use-system-ca".to_string());
+        args.push(use_system_ca.to_string());
+    }
 
     Ok(())
 }
@@ -4565,6 +4625,30 @@ mod tests {
     }
 
     #[test]
+    fn call_tool_rejects_unknown_argument() {
+        let err = call_tool(
+            Some(&json!({
+                "name": TOOL_TAB_CLOSE,
+                "arguments": {"tabId": "t13"}
+            })),
+            &McpConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("tabId"));
+        let listed = err.message.split("Tool arguments:").nth(1).unwrap();
+        assert!(listed.contains("tab"));
+        assert!(!listed.contains("session"));
+    }
+
+    #[test]
+    fn reject_unknown_arguments_accepts_declared_and_shared_keys() {
+        let definition = find_tool(TOOL_CLICK).unwrap();
+        let args = json!({"selector": "@e1", "session": "s", "timeoutMs": 5});
+        reject_unknown_arguments(TOOL_CLICK, &definition, &args).unwrap();
+    }
+
+    #[test]
     fn tools_profiles_tool_lists_startup_profiles() {
         let result = call_tool(
             Some(&json!({
@@ -4717,6 +4801,40 @@ mod tests {
     }
 
     #[test]
+    fn obscura_extra_args_use_the_canonical_cli_parser() {
+        let arguments = json!({"extraArgs": [
+            "--engine", "obscura", "--executable-path", "/tmp/obscura",
+            "--proxy-bypass", "localhost"
+        ]});
+        let mut args = vec!["open".to_string(), "https://example.com".to_string()];
+        args.extend(
+            optional_string_array(&arguments, "extraArgs")
+                .unwrap()
+                .unwrap(),
+        );
+        let flags = crate::flags::parse_flags(&args);
+        assert_eq!(flags.engine.as_deref(), Some("obscura"));
+        assert_eq!(flags.executable_path.as_deref(), Some("/tmp/obscura"));
+        assert_eq!(flags.proxy_bypass.as_deref(), Some("localhost"));
+        let mut launch = json!({"action": "launch"});
+        crate::attach_obscura_proxy_bypass(&mut launch, &flags);
+        assert_eq!(launch["proxyBypass"], "localhost");
+        assert!(launch.get("proxy").is_none());
+
+        let mut flags = flags;
+        flags.proxy_bypass = None;
+        crate::attach_obscura_proxy_bypass(&mut launch, &flags);
+        assert_eq!(launch.get("proxyBypass"), Some(&Value::Null));
+        for engine in [None, Some("chrome"), Some("lightpanda")] {
+            flags.engine = engine.map(String::from);
+            flags.proxy_bypass = Some("localhost".into());
+            let mut launch = json!({"action": "launch"});
+            crate::attach_obscura_proxy_bypass(&mut launch, &flags);
+            assert_eq!(launch, json!({"action": "launch"}));
+        }
+    }
+
+    #[test]
     fn common_global_args_use_equals_form_for_string_restore_key() {
         let mut args = Vec::new();
 
@@ -4779,6 +4897,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(args, vec!["--ca-cert", "/tmp/proxy-ca.pem"]);
+    }
+
+    #[test]
+    fn common_global_args_include_use_system_ca() {
+        let mut args = Vec::new();
+
+        append_common_global_args(&mut args, &json!({ "useSystemCa": true }), None).unwrap();
+
+        assert_eq!(args, vec!["--use-system-ca", "true"]);
     }
 
     #[test]
@@ -5241,6 +5368,27 @@ mod tests {
         assert!(!text.contains("\"webmcp\""));
         assert_eq!(result["structuredContent"]["response"], response);
         assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn tool_result_preserves_outcome_unknown_code() {
+        let run = CliRun {
+            exit_code: Some(1),
+            stdout: json!({
+                "success": false,
+                "error": "Failed to read: Connection reset by peer (os error 54) (the command reached the daemon but no response came back; it may or may not have run, so it was not retried)",
+                "code": "outcome_unknown"
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+
+        let result = tool_result_from_run(run);
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["response"]["code"],
+            "outcome_unknown"
+        );
     }
 
     #[test]

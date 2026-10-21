@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::stream::BoxStream;
 use futures_util::{SinkExt, StreamExt};
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -17,6 +18,10 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 
+use super::process::{
+    write_control_message_async, BrowserControlPipe, BrowserControlPipeControl,
+    BrowserControlPipeReader,
+};
 use super::types::{CdpCommand, CdpError, CdpEvent, CdpMessage};
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<CdpMessage>>>>;
@@ -33,16 +38,46 @@ type WsTx = Arc<
 
 /// Sessions whose events go to one private receiver instead of the broadcast.
 type PrivateSessions = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<CdpEvent>>>>;
+type PipeTx = Arc<Mutex<Option<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>>;
+
+struct TransportParts {
+    ws_tx: Option<WsTx>,
+    pipe_tx: Option<PipeTx>,
+    pipe_control: Option<Arc<dyn BrowserControlPipeControl>>,
+    socket: Option<socket2::Socket>,
+}
+
+struct PipeWriteCancelGuard {
+    control: Arc<dyn BrowserControlPipeControl>,
+    closed: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for PipeWriteCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.closed.store(true, Ordering::SeqCst);
+            self.control.shutdown();
+        }
+    }
+}
 
 /// Events buffered for a private session receiver that has fallen behind.
 /// Newer events are dropped once it is full; a screencast consumer that
 /// cannot keep up should lose frames, not stall the reader.
 const PRIVATE_SESSION_BUFFER: usize = 16;
 
+/// Lossless taps for events that must each get a reply (paused requests,
+/// auth challenges, targets waiting for the debugger). Unlike the bounded
+/// broadcast, a tap never drops an event when its reader falls behind.
+type MethodTaps =
+    Arc<std::sync::Mutex<Vec<(&'static [&'static str], mpsc::UnboundedSender<CdpEvent>)>>>;
+
 /// Interval between WebSocket ping frames sent to keep the connection alive
 /// through intermediate proxies (reverse proxies, load balancers, service meshes).
 const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 const TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_CLOSED_ERROR: &str = "CDP connection closed";
 
 fn normalize_websocket_root_path(url: &str) -> String {
@@ -150,8 +185,10 @@ fn extract_command_id(msg: &str) -> Option<u64> {
 }
 
 pub struct CdpClient {
-    ws_tx: WsTx,
-    socket: socket2::Socket,
+    ws_tx: Option<WsTx>,
+    pipe_tx: Option<PipeTx>,
+    pipe_control: Option<Arc<dyn BrowserControlPipeControl>>,
+    socket: Option<socket2::Socket>,
     closed: Arc<AtomicBool>,
     close_complete: AtomicBool,
     close_lock: Mutex<()>,
@@ -164,6 +201,7 @@ pub struct CdpClient {
     keepalive_handle: Mutex<Option<JoinHandle<()>>>,
     private_sessions: PrivateSessions,
     stealth: AtomicBool,
+    method_taps: MethodTaps,
 }
 
 /// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
@@ -192,6 +230,10 @@ impl Drop for PendingGuard {
 }
 
 impl CdpClient {
+    pub fn is_pipe_transport(&self) -> bool {
+        self.pipe_tx.is_some()
+    }
+
     pub async fn connect(url: &str) -> Result<Self, String> {
         Self::connect_with_headers(url, None).await
     }
@@ -227,6 +269,49 @@ impl CdpClient {
         Self::connect_request(request, ws_config, None).await
     }
 
+    /// Connect to Chromium's inherited NUL-framed DevTools pipe. The pipe
+    /// endpoints use cancellable asynchronous IO; all CDP response and event
+    /// dispatch remains on the same async path as WebSocket connections.
+    pub async fn connect_pipe(pipe: BrowserControlPipe) -> Result<Self, String> {
+        let (reader, writer, control) = pipe.into_parts();
+        let reader = BrowserControlPipeReader::new(reader);
+        let incoming = Box::pin(futures_util::stream::unfold(
+            (reader, false),
+            |(mut reader, done)| async move {
+                if done {
+                    return None;
+                }
+                match reader.read_message().await {
+                    Ok(Some(bytes)) => {
+                        let message =
+                            String::from_utf8(bytes)
+                                .map(Message::Text)
+                                .map_err(|error| {
+                                    format!("invalid UTF-8 from Chromium CDP pipe: {error}")
+                                });
+                        Some((message, (reader, false)))
+                    }
+                    Ok(None) => None,
+                    Err(error) => Some((
+                        Err(format!("failed to read Chromium CDP pipe: {error}")),
+                        (reader, true),
+                    )),
+                }
+            },
+        ));
+        Self::from_transport(
+            TransportParts {
+                ws_tx: None,
+                pipe_tx: Some(Arc::new(Mutex::new(Some(writer)))),
+                pipe_control: Some(control),
+                socket: None,
+            },
+            incoming,
+            false,
+        )
+        .await
+    }
+
     async fn connect_request(
         request: Request<()>,
         ws_config: WebSocketConfig,
@@ -248,21 +333,48 @@ impl CdpClient {
             .try_clone()
             .map_err(|error| format!("Failed to duplicate CDP socket: {}", error))?;
 
-        let (ws_tx, mut ws_rx) = ws_stream.split();
+        let (ws_tx, ws_rx) = ws_stream.split();
         let ws_tx = Arc::new(Mutex::new(ws_tx));
 
+        let incoming = Box::pin(ws_rx.map(|message| message.map_err(|error| error.to_string())));
+        Self::from_transport(
+            TransportParts {
+                ws_tx: Some(ws_tx),
+                pipe_tx: None,
+                pipe_control: None,
+                socket: Some(socket),
+            },
+            incoming,
+            true,
+        )
+        .await
+    }
+
+    async fn from_transport(
+        parts: TransportParts,
+        mut ws_rx: BoxStream<'static, Result<Message, String>>,
+        websocket_keepalive: bool,
+    ) -> Result<Self, String> {
+        let TransportParts {
+            ws_tx,
+            pipe_tx,
+            pipe_control,
+            socket,
+        } = parts;
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, _) = broadcast::channel(4096);
         let (raw_tx, _) = broadcast::channel(4096);
         let closed = Arc::new(AtomicBool::new(false));
 
         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let method_taps: MethodTaps = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
         let raw_tx_clone = raw_tx.clone();
         let closed_reader = closed.clone();
         let private_clone = private_sessions.clone();
+        let taps_clone = method_taps.clone();
 
         // Notify used to stop the keepalive task when the reader loop exits.
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
@@ -372,6 +484,12 @@ impl CdpClient {
                         }
                     });
                     if !routed {
+                        let mut taps = taps_clone.lock().unwrap_or_else(|e| e.into_inner());
+                        taps.retain(|(methods, tx)| {
+                            !methods.contains(&event.method.as_str())
+                                || tx.send(event.clone()).is_ok()
+                        });
+                        drop(taps);
                         let _ = event_tx_clone.send(event);
                     }
                 }
@@ -391,27 +509,33 @@ impl CdpClient {
         // interval. This prevents intermediate proxies (Envoy, nginx, OpenResty,
         // cloud load balancers) from closing idle WebSocket connections. If the
         // send fails, the connection is dead and we stop pinging.
-        let keepalive_tx = ws_tx.clone();
-        let closed_keepalive = closed.clone();
-        let keepalive_handle = tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(WS_KEEPALIVE_INTERVAL_SECS);
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(interval) => {}
-                    _ = cancel_rx.changed() => break,
+        let keepalive_handle = if websocket_keepalive {
+            let keepalive_tx = ws_tx.clone().expect("WebSocket transport has a sink");
+            let closed_keepalive = closed.clone();
+            Some(tokio::spawn(async move {
+                let interval = std::time::Duration::from_secs(WS_KEEPALIVE_INTERVAL_SECS);
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => {}
+                        _ = cancel_rx.changed() => break,
+                    }
+                    let mut tx = keepalive_tx.lock().await;
+                    if closed_keepalive.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if tx.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
                 }
-                let mut tx = keepalive_tx.lock().await;
-                if closed_keepalive.load(Ordering::SeqCst) {
-                    break;
-                }
-                if tx.send(Message::Ping(Vec::new())).await.is_err() {
-                    break;
-                }
-            }
-        });
+            }))
+        } else {
+            None
+        };
 
         Ok(Self {
             ws_tx,
+            pipe_tx,
+            pipe_control,
             socket,
             closed,
             close_complete: AtomicBool::new(false),
@@ -422,9 +546,10 @@ impl CdpClient {
             event_tx,
             raw_tx,
             reader_handle: Mutex::new(Some(reader_handle)),
-            keepalive_handle: Mutex::new(Some(keepalive_handle)),
+            keepalive_handle: Mutex::new(keepalive_handle),
             private_sessions,
             stealth: AtomicBool::new(false),
+            method_taps,
         })
     }
 
@@ -451,6 +576,46 @@ impl CdpClient {
         }
     }
 
+    async fn send_transport_text(&self, text: String) -> Result<(), String> {
+        self.ensure_open()?;
+        if let Some(ws_tx) = &self.ws_tx {
+            return ws_tx
+                .lock()
+                .await
+                .send(Message::Text(text))
+                .await
+                .map_err(|error| format!("Failed to send CDP command: {error}"));
+        }
+        let Some(pipe_tx) = &self.pipe_tx else {
+            return Err(CONNECTION_CLOSED_ERROR.to_owned());
+        };
+        let pipe_tx = pipe_tx.clone();
+        let mut cancel = PipeWriteCancelGuard {
+            control: self
+                .pipe_control
+                .as_ref()
+                .expect("pipe has cancellation control")
+                .clone(),
+            closed: self.closed.clone(),
+            armed: true,
+        };
+        let result = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
+            let mut pipe = pipe_tx.lock().await;
+            let writer = pipe
+                .as_mut()
+                .ok_or_else(|| CONNECTION_CLOSED_ERROR.to_owned())?;
+            write_control_message_async(&mut **writer, text.as_bytes())
+                .await
+                .map_err(|error| format!("Failed to write CDP pipe command: {error}"))
+        })
+        .await
+        .map_err(|_| "timed out writing CDP command to Chromium pipe".to_owned())?;
+        if result.is_ok() {
+            cancel.armed = false;
+        }
+        result
+    }
+
     async fn abort_task(handle: &Mutex<Option<JoinHandle<()>>>) {
         let Some(task) = handle.lock().await.take() else {
             return;
@@ -469,13 +634,23 @@ impl CdpClient {
         let _ = self.cancel_tx.send(true);
         Self::abort_task(&self.keepalive_handle).await;
 
-        let _ = tokio::time::timeout(TRANSPORT_CLOSE_TIMEOUT, async {
-            let mut ws_tx = self.ws_tx.lock().await;
-            let _ = ws_tx.close().await;
-        })
-        .await;
+        if let Some(ws_tx) = &self.ws_tx {
+            let _ = tokio::time::timeout(TRANSPORT_CLOSE_TIMEOUT, async {
+                let mut ws_tx = ws_tx.lock().await;
+                let _ = ws_tx.close().await;
+            })
+            .await;
+        }
 
-        let _ = self.socket.shutdown(Shutdown::Both);
+        if let Some(socket) = &self.socket {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        if let Some(control) = &self.pipe_control {
+            control.shutdown();
+        }
+        if let Some(pipe_tx) = &self.pipe_tx {
+            pipe_tx.lock().await.take();
+        }
         Self::abort_task(&self.reader_handle).await;
         self.pending.lock().await.clear();
         self.close_complete.store(true, Ordering::SeqCst);
@@ -512,15 +687,14 @@ impl CdpClient {
         };
 
         {
-            let mut ws_tx = self.ws_tx.lock().await;
             self.ensure_open()?;
             let mut pending = self.pending.lock().await;
             pending.insert(id, tx);
             drop(pending);
-            if let Err(error) = ws_tx.send(Message::Text(json)).await {
+            if let Err(error) = self.send_transport_text(json).await {
                 self.pending.lock().await.remove(&id);
                 guard.done = true;
-                return Err(format!("Failed to send CDP command: {}", error));
+                return Err(error);
             }
         }
 
@@ -549,6 +723,21 @@ impl CdpClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Deliver every event whose method is in `methods` to the returned
+    /// receiver without loss. The events still reach the broadcast. Dropping
+    /// the receiver ends the tap on the next matching event.
+    pub fn subscribe_methods(
+        &self,
+        methods: &'static [&'static str],
+    ) -> mpsc::UnboundedReceiver<CdpEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.method_taps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((methods, tx));
+        rx
     }
 
     /// Deliver every event carrying `session_id` to the returned receiver
@@ -637,23 +826,21 @@ impl CdpClient {
         let json = serde_json::to_string(&cmd)
             .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
 
-        let mut ws_tx = self.ws_tx.lock().await;
-        self.ensure_open()?;
-        ws_tx
-            .send(Message::Text(json))
-            .await
-            .map_err(|e| format!("Failed to send CDP command: {}", e))
+        self.send_transport_text(json).await
     }
 
     /// Send raw JSON through the WebSocket without tracking a response.
     /// Used by the inspect proxy to forward DevTools frontend messages.
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
-        let mut ws_tx = self.ws_tx.lock().await;
-        self.ensure_open()?;
-        ws_tx
-            .send(Message::Text(json))
-            .await
-            .map_err(|e| format!("Failed to send raw CDP message: {}", e))
+        if self.pipe_tx.is_some() {
+            return Err("raw CDP forwarding is unavailable for inherited-pipe sessions".to_owned());
+        }
+        self.send_transport_text(json).await.map_err(|error| {
+            error.replace(
+                "Failed to send CDP command",
+                "Failed to send raw CDP message",
+            )
+        })
     }
 
     /// Test-only: count of in-flight commands still awaiting a response, so a
@@ -667,14 +854,19 @@ impl CdpClient {
 /// Lightweight handle for the inspect WebSocket proxy, holding only
 /// the cloneable parts of CdpClient needed for bidirectional message forwarding.
 pub struct InspectProxyHandle {
-    ws_tx: WsTx,
+    ws_tx: Option<WsTx>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     closed: Arc<AtomicBool>,
 }
 
 impl InspectProxyHandle {
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
-        let mut ws_tx = self.ws_tx.lock().await;
+        let Some(ws_tx) = &self.ws_tx else {
+            return Err(
+                "inspect WebSocket proxy is unavailable for inherited-pipe sessions".to_owned(),
+            );
+        };
+        let mut ws_tx = ws_tx.lock().await;
         if self.closed.load(Ordering::SeqCst) {
             return Err(CONNECTION_CLOSED_ERROR.to_string());
         }
@@ -728,9 +920,99 @@ mod tests {
     use serde_json::json;
     use std::io::Read;
     use std::net::TcpListener as StdTcpListener;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_pipe_dispatches_cdp_and_closes_after_child_eof() {
+        use crate::native::cdp::process::{
+            write_control_message_async, BrowserControlPipe, BrowserControlPipeControl,
+            BrowserControlPipeReader,
+        };
+        use tokio::net::UnixStream;
+
+        struct PipeControl;
+        impl BrowserControlPipeControl for PipeControl {
+            fn shutdown(&self) {}
+        }
+
+        let (client_side, child_side) = UnixStream::pair().unwrap();
+        let (client_reader, client_writer) = client_side.into_split();
+        let (child_reader, mut child_writer) = child_side.into_split();
+        let control = Arc::new(PipeControl);
+        let child = tokio::spawn(async move {
+            let request = BrowserControlPipeReader::new(Box::new(child_reader))
+                .read_message()
+                .await
+                .unwrap()
+                .unwrap();
+            let request: Value = serde_json::from_slice(&request).unwrap();
+            let response = serde_json::json!({
+                "id": request["id"],
+                "result": { "product": "Chrome/pipe-test" }
+            });
+            write_control_message_async(&mut child_writer, response.to_string().as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let client = CdpClient::connect_pipe(BrowserControlPipe::new(
+            Box::new(client_reader),
+            Box::new(client_writer),
+            control,
+        ))
+        .await
+        .unwrap();
+        assert!(client.is_pipe_transport());
+        let version = client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        assert_eq!(version["product"], "Chrome/pipe-test");
+        child.await.unwrap();
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_full_pipe_write_closes_transport_and_allows_bounded_close() {
+        use crate::native::cdp::process::{BrowserControlPipe, BrowserControlPipeControl};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct PipeControl(AtomicBool);
+        impl BrowserControlPipeControl for PipeControl {
+            fn shutdown(&self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (client_stream, peer_stream) = tokio::io::duplex(1);
+        let (reader, writer) = tokio::io::split(client_stream);
+        let control = Arc::new(PipeControl(AtomicBool::new(false)));
+        let client = CdpClient::connect_pipe(BrowserControlPipe::new(
+            Box::new(reader),
+            Box::new(writer),
+            control.clone(),
+        ))
+        .await
+        .unwrap();
+
+        {
+            let write = client.send_transport_text("x".repeat(1024));
+            tokio::pin!(write);
+            tokio::select! {
+                _ = &mut write => panic!("the fixture writer must remain blocked"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+
+        assert!(control.0.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), client.close())
+            .await
+            .expect("close must release the pipe after caller cancellation");
+        drop(peer_stream);
+    }
 
     const TEST_CERT_DER: &str = "MIIBPDCB46ADAgECAgkA9xwXmIhbzQIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgzMDA1NTU0NFoXDTM2MDgyNzA1NTU0NFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQdmPO0sXXFRmVn7+8MViXGom2rYy8aV3Oc0pNZhUmFGaPl4MRFzc1G0yaV/WRBPF/BUh2LGsXCvUsn7NqaYkFaMeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQC32oureGNAupABEmonQPAQBD7OdJjXmUxoVQNr0UB+6AIgb23GMwxTjwHyLG4tZcJST7r3cCW8K/Y+1h618j2f+Uw=";
     const TEST_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIVZST8Vhc5f3OW+4kF78f8o1nQCRwjW/Yo8CXQ35Y9uhRANCAARB2Y87SxdcVGZWfv7wxWJcaibatjLxpXc5zSk1mFSYUZo+XgxEXNzUbTJpX9ZEE8X8FSHYsaxcK9Syfs2ppiQV";
@@ -1088,7 +1370,7 @@ mod tests {
 
         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
         accepted_rx.await.unwrap();
-        let sink_guard = client.ws_tx.lock().await;
+        let sink_guard = client.ws_tx.as_ref().unwrap().lock().await;
         let close_client = client.clone();
         tokio::time::timeout(Duration::from_secs(1), async move {
             close_client.close().await;
@@ -1199,26 +1481,42 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut path_tx = Some(path_tx);
-            let _ = tokio_tungstenite::accept_hdr_async(
-                stream,
-                move |
-                    request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                    response: tokio_tungstenite::tungstenite::handshake::server::Response,
-                | {
-                    if let Some(tx) = path_tx.take() {
-                        let path = request
-                            .uri()
-                            .path_and_query()
-                            .map(|value| value.as_str().to_string())
-                            .unwrap_or_default();
-                        let _ = tx.send(path);
-                    }
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let end = line == "\r\n" || line == "\n";
+                request.push_str(&line);
+                if end {
+                    break;
+                }
+            }
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_owned();
+            let _ = path_tx.send(path);
+            let key = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| value.trim().to_owned())
+                })
+                .expect("WebSocket request contains its key");
+            let accept =
+                tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            );
+            stream
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
         });
 
         let url = format!("ws://127.0.0.1:{}?token=a%2Fb&scope=browser%20test", port);
@@ -1284,6 +1582,53 @@ mod tests {
         );
 
         client.unsubscribe_session("S-REC");
+        drop(client);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn method_tap_keeps_every_event_when_the_broadcast_lags() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ready_rx.await.unwrap();
+            for i in 0..7000 {
+                let method = if i % 7 == 0 {
+                    "Fetch.requestPaused"
+                } else {
+                    "Network.dataReceived"
+                };
+                let msg = serde_json::json!({ "method": method, "params": { "n": i } });
+                ws.send(Message::Text(msg.to_string())).await.unwrap();
+            }
+            let _ = ws.next().await;
+        });
+
+        let client = CdpClient::connect(&format!("ws://127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let mut broadcast_rx = client.subscribe();
+        let mut tap = client.subscribe_methods(&["Fetch.requestPaused"]);
+        ready_tx.send(()).unwrap();
+
+        let wait = std::time::Duration::from_secs(5);
+        for expected in (0..7000).step_by(7) {
+            let event = tokio::time::timeout(wait, tap.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.method, "Fetch.requestPaused");
+            assert_eq!(event.params["n"], expected);
+        }
+        assert!(matches!(
+            broadcast_rx.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+
         drop(client);
         server.abort();
     }

@@ -10,11 +10,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::discovery::discover_cdp_url;
+use super::process::{
+    spawn_chrome_process, BrowserChildProcess, BrowserControlPipe, BrowserControlTransport,
+    BrowserLaunchSpec, BrowserSpawnSupervisor,
+};
 use crate::ca_bundle::CaBundle;
 
 pub struct ChromeProcess {
-    child: Child,
+    child: ChromeChild,
     pub ws_url: String,
+    control_pipe: std::sync::Mutex<Option<BrowserControlPipe>>,
+    supervised_pipe: bool,
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
     temp_user_data_dir: Option<PathBuf>,
     temp_nss_home: Option<PreparedNssHome>,
     /// On Unix, the process group ID used to kill the entire Chrome process tree.
@@ -24,6 +31,79 @@ pub struct ChromeProcess {
     /// hosts. Dropped (and killed) after the Chrome tree is torn down.
     #[cfg(target_os = "linux")]
     xvfb: Option<XvfbServer>,
+}
+
+enum ChromeChild {
+    Standard(std::sync::Mutex<Child>),
+    Supervised(std::sync::Mutex<Box<dyn BrowserChildProcess>>),
+}
+
+impl ChromeChild {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Standard(child) => child.lock().unwrap_or_else(|e| e.into_inner()).id(),
+            Self::Supervised(child) => child.lock().unwrap_or_else(|e| e.into_inner()).id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Standard(child) => child
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_wait(),
+            Self::Supervised(child) => child
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_wait(),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            Self::Standard(child) => child.get_mut().unwrap_or_else(|e| e.into_inner()).wait(),
+            Self::Supervised(child) => child.get_mut().unwrap_or_else(|e| e.into_inner()).wait(),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+        match self {
+            Self::Standard(child) => {
+                let child = child.get_mut().unwrap_or_else(|e| e.into_inner());
+                #[cfg(windows)]
+                {
+                    child.stderr.take().map(|stderr| Box::new(stderr) as _)
+                }
+                #[cfg(not(windows))]
+                {
+                    child.stderr.take().map(|stderr| Box::new(stderr) as _)
+                }
+            }
+            Self::Supervised(child) => child
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_stderr(),
+        }
+    }
+
+    fn terminate_tree(&mut self) {
+        match self {
+            Self::Standard(child) => {
+                let child = child.get_mut().unwrap_or_else(|e| e.into_inner());
+                let _ = child.kill();
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+            }
+            Self::Supervised(child) => {
+                let child = child.get_mut().unwrap_or_else(|e| e.into_inner());
+                let _ = child.terminate_tree();
+                let _ = child.wait();
+            }
+        }
+    }
 }
 
 struct PreparedNssHomeInner {
@@ -61,19 +141,34 @@ impl PreparedNssHome {
 }
 
 impl ChromeProcess {
+    pub(crate) fn take_control_pipe(&mut self) -> Option<BrowserControlPipe> {
+        self.control_pipe
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    pub(crate) fn has_control_pipe(&self) -> bool {
+        self.supervised_pipe
+    }
+
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
+        self.child.terminate_tree();
         // On Unix, kill the entire process group to ensure Chrome helper
         // processes (GPU, renderer, utility, crashpad) are also terminated.
         // This prevents orphaned Chrome processes from blocking the user's
         // normal Chrome (issue #1113).
         #[cfg(unix)]
-        if let Some(pgid) = self.pgid {
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
+        if matches!(&self.child, ChromeChild::Standard(_)) {
+            if let Some(pgid) = self.pgid {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
             }
         }
-        let _ = self.child.wait();
+        if let Some(stderr_drain) = self.stderr_drain.take() {
+            let _ = stderr_drain.join();
+        }
     }
 
     /// Returns the OS process ID of the Chrome child process.
@@ -96,7 +191,15 @@ impl ChromeProcess {
 
         while start.elapsed() < timeout {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => {
+                    if matches!(&self.child, ChromeChild::Supervised(_)) {
+                        self.child.terminate_tree();
+                        if let Some(stderr_drain) = self.stderr_drain.take() {
+                            let _ = stderr_drain.join();
+                        }
+                    }
+                    return;
+                }
                 Ok(None) => std::thread::sleep(poll_interval),
                 Err(_) => break,
             }
@@ -435,6 +538,13 @@ struct ChromeArgs {
 }
 
 fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+    build_chrome_args_for_transport(options, BrowserControlTransport::WebSocket)
+}
+
+fn build_chrome_args_for_transport(
+    options: &LaunchOptions,
+    control_transport: BrowserControlTransport,
+) -> Result<ChromeArgs, String> {
     // Chrome only honors the last --enable-features switch on the command
     // line, so every feature must be collected into a single flag.
     let mut enable_features: Vec<String> = vec![
@@ -463,12 +573,24 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
                 }
             }
         } else {
+            if control_transport == BrowserControlTransport::InheritedPipe
+                && (arg.starts_with("--remote-debugging-port")
+                    || arg.starts_with("--remote-debugging-pipe")
+                    || arg.starts_with("--remote-debugging-io-pipes"))
+            {
+                return Err("custom remote debugging arguments are not allowed with supervised pipe launches".to_owned());
+            }
             user_args.push(arg.clone());
         }
     }
 
+    let remote_debugging_arg = match control_transport {
+        BrowserControlTransport::WebSocket => "--remote-debugging-port=0",
+        BrowserControlTransport::InheritedPipe if cfg!(windows) => "--remote-debugging-io-pipes",
+        BrowserControlTransport::InheritedPipe => "--remote-debugging-pipe",
+    };
     let mut args = vec![
-        "--remote-debugging-port=0".to_string(),
+        remote_debugging_arg.to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-background-networking".to_string(),
@@ -716,6 +838,14 @@ fn terminate_launched_chrome(child: &mut Child) {
 }
 
 pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
+    launch_chrome_with_supervisor(options, None, false)
+}
+
+pub fn launch_chrome_with_supervisor(
+    options: &LaunchOptions,
+    supervisor: Option<Arc<dyn BrowserSpawnSupervisor>>,
+    required: bool,
+) -> Result<ChromeProcess, String> {
     let chrome_path = match &options.executable_path {
         Some(p) => PathBuf::from(p),
         None => find_chrome().ok_or_else(|| {
@@ -759,11 +889,22 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
 
     let effective_options = resolved_options.as_ref().unwrap_or(options);
 
+    let use_supervisor = supervisor.is_some() || required;
     let max_attempts = 3;
     let mut last_err = String::new();
 
     for attempt in 1..=max_attempts {
-        match try_launch_chrome(&chrome_path, effective_options) {
+        let launch_result = if use_supervisor {
+            try_launch_chrome_supervised(
+                &chrome_path,
+                effective_options,
+                supervisor.clone(),
+                required,
+            )
+        } else {
+            try_launch_chrome(&chrome_path, effective_options)
+        };
+        match launch_result {
             Ok(mut process) => {
                 // Transfer profile temp dir ownership to ChromeProcess for cleanup on Drop.
                 // The try_launch_chrome temp_user_data_dir is None here because we set profile
@@ -796,6 +937,117 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     }
 
     Err(last_err)
+}
+
+fn try_launch_chrome_supervised(
+    chrome_path: &Path,
+    options: &LaunchOptions,
+    supervisor: Option<Arc<dyn BrowserSpawnSupervisor>>,
+    required: bool,
+) -> Result<ChromeProcess, String> {
+    let ChromeArgs {
+        args,
+        user_data_dir: _,
+        temp_user_data_dir,
+    } = build_chrome_args_for_transport(options, BrowserControlTransport::InheritedPipe)?;
+    let cleanup_temp_dir = |dir: &Option<PathBuf>| {
+        if let Some(dir) = dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let temp_nss_home = match resolve_prepared_nss_home(options) {
+        Ok(home) => home,
+        Err(error) => {
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(error);
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let temp_nss_home: Option<PreparedNssHome> = None;
+    #[cfg(target_os = "linux")]
+    let xvfb = maybe_start_xvfb(options);
+
+    let mut environment = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Some(ref xvfb) = xvfb {
+        environment.push(("DISPLAY".into(), xvfb.display.clone().into()));
+        environment.push(("XAUTHORITY".into(), xvfb.auth_file.clone().into()));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ref home) = temp_nss_home {
+        environment.push(("HOME".into(), home.path().as_os_str().to_owned()));
+        environment.push((
+            "XDG_DATA_HOME".into(),
+            home.path().join(".local/share").into_os_string(),
+        ));
+    }
+
+    let spec = BrowserLaunchSpec::new(
+        chrome_path.to_path_buf(),
+        args,
+        environment,
+        options.effectively_headless(),
+        BrowserControlTransport::InheritedPipe,
+    );
+    let mut child = match spawn_chrome_process(spec, supervisor, required, |_| {
+        Err("supervised Chrome launch has no standard-spawn fallback".to_owned())
+    }) {
+        Ok(child) => child,
+        Err(error) => {
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(error);
+        }
+    };
+    let mut stderr_drain = match child.take_stderr() {
+        Some(mut stderr) => match std::thread::Builder::new()
+            .name("agent-browser-chrome-stderr".to_owned())
+            .spawn(move || {
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            }) {
+            Ok(reader) => Some(reader),
+            Err(error) => {
+                let _ = child.terminate_tree();
+                cleanup_temp_dir(&temp_user_data_dir);
+                return Err(format!("failed to drain supervised Chrome stderr: {error}"));
+            }
+        },
+        None => None,
+    };
+    let pipe = match child.take_control_pipe() {
+        Ok(Some(pipe)) => pipe,
+        Ok(None) => {
+            let _ = child.terminate_tree();
+            if let Some(stderr_drain) = stderr_drain.take() {
+                let _ = stderr_drain.join();
+            }
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err("supervisor did not return Chromium's inherited DevTools pipes".to_owned());
+        }
+        Err(error) => {
+            let _ = child.terminate_tree();
+            if let Some(stderr_drain) = stderr_drain.take() {
+                let _ = stderr_drain.join();
+            }
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(format!(
+                "failed to take Chromium's inherited DevTools pipes: {error}"
+            ));
+        }
+    };
+    Ok(ChromeProcess {
+        child: ChromeChild::Supervised(std::sync::Mutex::new(child)),
+        ws_url: String::new(),
+        control_pipe: std::sync::Mutex::new(Some(pipe)),
+        supervised_pipe: true,
+        stderr_drain,
+        temp_user_data_dir,
+        temp_nss_home,
+        #[cfg(unix)]
+        pgid: None,
+        #[cfg(target_os = "linux")]
+        xvfb,
+    })
 }
 
 fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<ChromeProcess, String> {
@@ -910,6 +1162,17 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         }
     };
 
+    // Chrome blocks on stderr writes once the pipe buffer fills, so keep draining it
+    // after readiness. The fallback path has already taken stderr.
+    if let Some(stderr) = child.stderr.take() {
+        let _ = std::thread::Builder::new()
+            .name("chrome-stderr-drain".into())
+            .spawn(move || {
+                let mut stderr = stderr;
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            });
+    }
+
     #[cfg(unix)]
     let pgid = {
         let pid = child.id() as i32;
@@ -919,8 +1182,11 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     };
 
     Ok(ChromeProcess {
-        child,
+        child: ChromeChild::Standard(std::sync::Mutex::new(child)),
         ws_url,
+        control_pipe: std::sync::Mutex::new(None),
+        supervised_pipe: false,
+        stderr_drain: None,
         temp_user_data_dir,
         temp_nss_home,
         #[cfg(unix)]
@@ -1158,8 +1424,17 @@ pub async fn auto_connect_cdp() -> Result<String, String> {
 
     for dir in &user_data_dirs {
         if let Some((port, ws_path)) = read_devtools_active_port(dir) {
-            if let Ok(ws_url) = resolve_cdp_from_active_port(port, &ws_path).await {
-                return Ok(ws_url);
+            match resolve_cdp_from_active_port(port, &ws_path).await {
+                Ok(ws_url) => return Ok(ws_url),
+                // Chrome is alive and still showing the permission prompt.
+                // Probing further would open another prompt (#1365).
+                Err(ActivePortError::AwaitingApproval) => {
+                    return Err(format!(
+                        "Chrome is waiting for remote-debugging approval on port {}. Approve the prompt in Chrome and retry.",
+                        port
+                    ));
+                }
+                Err(ActivePortError::Unreachable(_)) => {}
             }
             // Port is dead — remove the stale file so future runs skip it.
             let stale = dir.join("DevToolsActivePort");
@@ -1183,10 +1458,28 @@ pub async fn auto_connect_cdp() -> Result<String, String> {
 /// prompt on M144+), then falls back to legacy HTTP discovery for older
 /// Chrome versions. This order avoids triggering duplicate remote-debugging
 /// permission prompts (#1210, #1206).
-async fn resolve_cdp_from_active_port(port: u16, ws_path: &str) -> Result<String, String> {
+async fn resolve_cdp_from_active_port(port: u16, ws_path: &str) -> Result<String, ActivePortError> {
+    resolve_cdp_from_active_port_within(port, ws_path, AUTO_CONNECT_WS_VERIFY_TIMEOUT).await
+}
+
+#[derive(Debug, PartialEq)]
+enum ActivePortError {
+    /// The handshake stayed open past the timeout: Chrome is holding it for
+    /// the remote-debugging permission prompt.
+    AwaitingApproval,
+    Unreachable(String),
+}
+
+async fn resolve_cdp_from_active_port_within(
+    port: u16,
+    ws_path: &str,
+    timeout: Duration,
+) -> Result<String, ActivePortError> {
     let ws_url = format!("ws://127.0.0.1:{}{}", port, ws_path);
-    if verify_ws_endpoint(&ws_url).await {
-        return Ok(ws_url);
+    match verify_ws_endpoint(&ws_url, timeout).await {
+        WsVerify::Live => return Ok(ws_url),
+        WsVerify::TimedOut => return Err(ActivePortError::AwaitingApproval),
+        WsVerify::Failed => {}
     }
 
     // Pre-M144 fallback: HTTP endpoints (/json/version, /json/list, etc.)
@@ -1194,19 +1487,31 @@ async fn resolve_cdp_from_active_port(port: u16, ws_path: &str) -> Result<String
         return Ok(ws_url);
     }
 
-    Err(format!(
+    Err(ActivePortError::Unreachable(format!(
         "Cannot connect to Chrome on port {}: both direct WebSocket and HTTP discovery failed",
         port
-    ))
+    )))
+}
+
+/// How long `--auto-connect` keeps the direct WebSocket handshake open.
+/// Chrome 144+ holds the handshake while it shows the remote-debugging
+/// permission prompt, so this must leave time to approve it (#1365). It stays
+/// below the client's 30s read timeout (`connection::read_timeout_for`) so the
+/// daemon answers before the client gives up and retries.
+const AUTO_CONNECT_WS_VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
+
+enum WsVerify {
+    Live,
+    TimedOut,
+    Failed,
 }
 
 /// Verify that a WebSocket endpoint is a live CDP server by sending
 /// `Browser.getVersion` and checking for a valid response.
-async fn verify_ws_endpoint(ws_url: &str) -> bool {
+async fn verify_ws_endpoint(ws_url: &str, timeout: Duration) -> WsVerify {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let timeout = Duration::from_secs(2);
     let result = tokio::time::timeout(timeout, async {
         let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.ok()?;
         let cmd = r#"{"id":1,"method":"Browser.getVersion"}"#;
@@ -1224,7 +1529,11 @@ async fn verify_ws_endpoint(ws_url: &str) -> bool {
         None
     })
     .await;
-    matches!(result, Ok(Some(())))
+    match result {
+        Ok(Some(())) => WsVerify::Live,
+        Ok(None) => WsVerify::Failed,
+        Err(_) => WsVerify::TimedOut,
+    }
 }
 
 /// Returns the default Chrome user-data directory paths for the current platform.
@@ -1779,6 +2088,50 @@ fn expand_tilde(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_launch_keeps_websocket_control_transport() {
+        let result = build_chrome_args(&LaunchOptions::default()).unwrap();
+        assert!(result
+            .args
+            .iter()
+            .any(|arg| arg == "--remote-debugging-port=0"));
+        assert!(!result.args.iter().any(|arg| {
+            arg == "--remote-debugging-pipe" || arg.starts_with("--remote-debugging-io-pipes")
+        }));
+        let _ = std::fs::remove_dir_all(result.temp_user_data_dir.unwrap());
+    }
+
+    #[test]
+    fn inherited_pipe_launch_disables_tcp_cdp_and_rejects_user_overrides() {
+        let options = LaunchOptions::default();
+        let result =
+            build_chrome_args_for_transport(&options, BrowserControlTransport::InheritedPipe)
+                .unwrap();
+        let expected = if cfg!(windows) {
+            "--remote-debugging-io-pipes"
+        } else {
+            "--remote-debugging-pipe"
+        };
+        assert!(result.args.iter().any(|arg| arg == expected));
+        assert!(!result
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("--remote-debugging-port")));
+        let _ = std::fs::remove_dir_all(result.temp_user_data_dir.unwrap());
+
+        for arg in ["--remote-debugging-port=9222", "--remote-debugging-pipe"] {
+            let options = LaunchOptions {
+                args: vec![arg.to_owned()],
+                ..Default::default()
+            };
+            assert!(build_chrome_args_for_transport(
+                &options,
+                BrowserControlTransport::InheritedPipe,
+            )
+            .is_err());
+        }
+    }
     use crate::test_utils::EnvGuard;
 
     #[test]
@@ -1794,6 +2147,63 @@ mod tests {
         assert!(!should_disable_dev_shm(&[
             "--disable-dev-shm-usage".to_string()
         ]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_stderr_drained_after_port_readiness() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let executable = fixture.path().join("chrome");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+set -eu
+for arg do
+    case "$arg" in --user-data-dir=*) profile="${arg#*=}" ;; esac
+done
+printf '9222\n/devtools/browser/stderr-test\n' > "$profile/DevToolsActivePort"
+for round in 1 2; do
+    while [ ! -f "$profile/request-$round" ]; do sleep 0.01; done
+    printf '\377' >&2
+    head -c 2097152 /dev/zero >&2
+    touch "$profile/drained-$round"
+done
+exec sleep 60
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let options = LaunchOptions {
+            headless: true,
+            ..Default::default()
+        };
+        let mut chrome = try_launch_chrome(&executable, &options).unwrap();
+        let profile = chrome.temp_user_data_dir.clone().unwrap();
+        assert_eq!(
+            chrome.ws_url,
+            "ws://127.0.0.1:9222/devtools/browser/stderr-test"
+        );
+        for round in 1..=2 {
+            std::fs::write(profile.join(format!("request-{round}")), b"").unwrap();
+            let drained = profile.join(format!("drained-{round}"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !drained.exists() && std::time::Instant::now() < deadline {
+                assert!(
+                    !chrome.has_exited(),
+                    "writer exited before completing stderr"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                drained.exists(),
+                "stderr burst {round} blocked after readiness"
+            );
+            assert!(!chrome.has_exited());
+        }
+        drop(chrome);
+        assert!(!profile.exists());
     }
 
     fn prepared_nss_home() -> PreparedNssHome {
@@ -2383,8 +2793,11 @@ mod tests {
             // logic by creating a small helper process.
             let child = spawn_noop_child();
             let _process = ChromeProcess {
-                child,
+                child: ChromeChild::Standard(std::sync::Mutex::new(child)),
                 ws_url: String::new(),
+                control_pipe: std::sync::Mutex::new(None),
+                supervised_pipe: false,
+                stderr_drain: None,
                 temp_user_data_dir: Some(dir.clone()),
                 temp_nss_home: None,
                 #[cfg(unix)]
@@ -2774,6 +3187,39 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// Chrome 144+ holds the WebSocket handshake while the remote-debugging
+    /// permission prompt is open. A handshake that completes after a few
+    /// seconds must still resolve through the exact ws_path (#1365).
+    #[tokio::test]
+    async fn test_resolve_cdp_from_active_port_waits_for_permission_prompt() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ws_path = "/devtools/browser/prompt-uuid".to_string();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            if let Some(Ok(WsMsg::Text(text))) = ws.next().await {
+                let req: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let id = req.get("id").unwrap();
+                let reply = format!(
+                    r#"{{"id":{},"result":{{"protocolVersion":"1.3","product":"Chrome/148"}}}}"#,
+                    id
+                );
+                ws.send(WsMsg::Text(reply)).await.unwrap();
+            }
+            let _ = ws.close(None).await;
+        });
+
+        let result = resolve_cdp_from_active_port(port, &ws_path).await;
+        assert_eq!(result, Ok(format!("ws://127.0.0.1:{}{}", port, ws_path)));
+        server.await.unwrap();
+    }
+
     /// When the exact ws_path connection fails, `resolve_cdp_from_active_port`
     /// should fall back to HTTP discovery.
     #[tokio::test]
@@ -2823,6 +3269,44 @@ mod tests {
         drop(listener);
 
         let result = resolve_cdp_from_active_port(port, "/devtools/browser/dead").await;
-        assert!(result.is_err(), "should fail when nothing is listening");
+        assert!(
+            matches!(result, Err(ActivePortError::Unreachable(_))),
+            "should fail when nothing is listening: {:?}",
+            result
+        );
+    }
+
+    /// A handshake still held open when the timeout expires means Chrome is
+    /// showing the permission prompt. Resolution must stop without HTTP
+    /// discovery, which would open a second prompt (#1365).
+    #[tokio::test]
+    async fn test_resolve_cdp_from_active_port_stops_while_prompt_is_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (held, _) = listener.accept().await.unwrap();
+            let second = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
+            drop(held);
+            second.is_ok()
+        });
+
+        let result = resolve_cdp_from_active_port_within(
+            port,
+            "/devtools/browser/prompt",
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(result, Err(ActivePortError::AwaitingApproval));
+        assert!(
+            !server.await.unwrap(),
+            "HTTP discovery must not run while the prompt is open"
+        );
+    }
+
+    #[test]
+    fn auto_connect_wait_stays_below_client_read_timeout() {
+        let client_floor = crate::connection::read_timeout_for(&serde_json::json!({}));
+        assert!(AUTO_CONNECT_WS_VERIFY_TIMEOUT < client_floor);
     }
 }
