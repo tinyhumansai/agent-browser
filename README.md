@@ -1732,7 +1732,13 @@ let reply = execute_command(
 
 `StateOptions` is the configuration a host builds directly, field by field, instead of `DaemonState::new()` reading it from the `AGENT_BROWSER_*` environment. That distinction matters for embedding: a process hosting multiple embedded sessions never has them reading and clobbering each other's configuration through shared environment variables. `DaemonState::new()` and `Default::default()` still read the environment, so the CLI's daemon is unaffected.
 
-`execute_command` takes the same JSON command shape the daemon reads from its socket and returns the same JSON response shape, documented under [Commands](#commands) above. There is no separate library API to learn beyond `StateOptions`, `DaemonState`, and `execute_command`; everything else about a command's request and response is exactly what the CLI already documents.
+`execute_command` takes the same JSON command shape the daemon reads from its socket and returns the same JSON response shape, documented under [Commands](#commands) above. There is no separate command API beyond `StateOptions`, `DaemonState`, and `execute_command`; everything else about a command's request and response is exactly what the CLI already documents.
+
+### Trusted browser process supervisors
+
+An embedding host can set `StateOptions::browser_spawn_supervisor` to its native process supervisor and `require_browser_spawn_supervisor: true` to require it for every locally launched Chrome session. The required mode rejects remote CDP, auto-connect, provider, and non-Chrome launch routes before they create a browser. With no supervisor configured, ordinary launches retain the WebSocket transport.
+
+The supervisor receives an immutable `BrowserLaunchSpec`, owns the Chrome process tree, and returns the parent ends of Chromium's inherited control pipes. Agent-browser sends and receives CDP directly through those pipes; it does not open a second control socket. Its preflight must reject unsupported isolation or pipe capabilities before process creation. On Windows, the host must pass only the exact child pipe handles named in `--remote-debugging-io-pipes` through its process handle allowlist. The required flag and pipe transport do not enforce network isolation by themselves; the embedding host must provide and verify the native boundary.
 
 ### Identity launch fields
 

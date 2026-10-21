@@ -5,7 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 
-use super::cdp::chrome::{auto_connect_cdp, launch_chrome, ChromeProcess, LaunchOptions};
+#[cfg(test)]
+use super::cdp::chrome::launch_chrome;
+use super::cdp::chrome::{
+    auto_connect_cdp, launch_chrome_with_supervisor, ChromeProcess, LaunchOptions,
+};
 use super::cdp::client::CdpClient;
 use super::cdp::discovery::discover_cdp_url;
 use super::cdp::lightpanda::{launch_lightpanda, LightpandaLaunchOptions, LightpandaProcess};
@@ -398,6 +402,10 @@ impl BrowserProcess {
             BrowserProcess::Lightpanda(_) => false,
         }
     }
+
+    pub fn is_supervised_pipe(&self) -> bool {
+        matches!(self, BrowserProcess::Chrome(process) if process.has_control_pipe())
+    }
 }
 
 pub struct BrowserManager {
@@ -471,7 +479,21 @@ impl BrowserManager {
     }
 
     pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
+        Self::launch_with_supervisor(options, engine, None, false).await
+    }
+
+    pub async fn launch_with_supervisor(
+        options: LaunchOptions,
+        engine: Option<&str>,
+        supervisor: Option<Arc<dyn super::cdp::process::BrowserSpawnSupervisor>>,
+        require_supervisor: bool,
+    ) -> Result<Self, String> {
         let engine = engine.unwrap_or("chrome");
+        if require_supervisor && engine != "chrome" {
+            return Err(
+                "required browser confinement supports only locally launched Chrome".to_owned(),
+            );
+        }
 
         match engine {
             "chrome" => {
@@ -509,7 +531,7 @@ impl BrowserManager {
         let download_path = options.download_path.clone();
         let headless = options.effectively_headless();
 
-        let (ws_url, process) = match engine {
+        let (ws_url, process, control_pipe) = match engine {
             "lightpanda" => {
                 let lp_options = LightpandaLaunchOptions {
                     executable_path: options.executable_path.clone(),
@@ -518,21 +540,29 @@ impl BrowserManager {
                 };
                 let lp = launch_lightpanda(&lp_options).await?;
                 let url = lp.ws_url.clone();
-                (url, BrowserProcess::Lightpanda(lp))
+                (url, BrowserProcess::Lightpanda(lp), None)
             }
             _ => {
-                let chrome = tokio::task::spawn_blocking(move || launch_chrome(&options))
-                    .await
-                    .map_err(|e| format!("Chrome launch task failed: {}", e))??;
+                let chrome = tokio::task::spawn_blocking(move || {
+                    launch_chrome_with_supervisor(&options, supervisor, require_supervisor)
+                })
+                .await
+                .map_err(|e| format!("Chrome launch task failed: {}", e))??;
+                let mut chrome = chrome;
                 let url = chrome.ws_url.clone();
-                (url, BrowserProcess::Chrome(chrome))
+                let control_pipe = chrome.take_control_pipe();
+                (url, BrowserProcess::Chrome(chrome), control_pipe)
             }
         };
 
         let mut manager = if engine == "lightpanda" {
             initialize_lightpanda_manager(ws_url, process).await?
         } else {
-            let client = Arc::new(CdpClient::connect(&ws_url).await?);
+            let client = Arc::new(if let Some(pipe) = control_pipe {
+                CdpClient::connect_pipe(pipe).await?
+            } else {
+                CdpClient::connect(&ws_url).await?
+            });
             // Before any target is attached: attaching enables domains.
             client.set_stealth(stealth);
             let mut manager = Self {
@@ -1356,15 +1386,29 @@ impl BrowserManager {
         &mut self,
         browser_close_timeout: Option<Duration>,
     ) -> Result<(), String> {
+        let close_pipe_child_first = self.client.is_pipe_transport()
+            && self
+                .browser_process
+                .as_ref()
+                .is_some_and(BrowserProcess::is_supervised_pipe);
         if self.browser_process.is_some() {
             // Only send Browser.close when we launched the browser ourselves.
             // For external connections (--auto-connect, --cdp) we just disconnect
             // without shutting down the user's browser.
             let close = self.client.send_command_no_params("Browser.close", None);
-            if let Some(timeout) = browser_close_timeout {
+            if let Some(timeout) = browser_close_timeout
+                .or_else(|| close_pipe_child_first.then_some(Duration::from_secs(2)))
+            {
                 let _ = tokio::time::timeout(timeout, close).await;
             } else {
                 let _ = close.await;
+            }
+        }
+
+        if close_pipe_child_first {
+            if let Some(mut process) = self.browser_process.take() {
+                let timeout = std::time::Duration::from_secs(5);
+                let _ = tokio::task::spawn_blocking(move || process.wait_or_kill(timeout)).await;
             }
         }
 

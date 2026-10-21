@@ -18,6 +18,7 @@ use super::auth;
 use super::browser::{should_track_target, wall_now, BrowserManager, InFlight, WaitUntil};
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
+use super::cdp::process::BrowserSpawnSupervisor;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CdpEvent, DispatchMouseEventParams,
     ExceptionThrownEvent, GetFullAXTreeResult, JavascriptDialogOpeningEvent, TargetCreatedEvent,
@@ -564,6 +565,12 @@ impl SessionSetup {
 /// of the process that hosts it.
 pub struct DaemonState {
     pub browser: Option<BrowserManager>,
+    /// Optional embedding-host process supervisor for locally launched Chrome.
+    /// Its `preflight` must reject unavailable control and native policy capabilities before spawn.
+    pub browser_spawn_supervisor: Option<Arc<dyn BrowserSpawnSupervisor>>,
+    /// Require the supervisor for local Chrome and refuse remote attach/provider routes.
+    /// This flag does not itself establish an operating-system network boundary.
+    pub require_browser_spawn_supervisor: bool,
     pub appium: Option<AppiumManager>,
     pub safari_driver: Option<safari::SafariDriverProcess>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
@@ -708,10 +715,16 @@ fn default_idle_shutdown_is_blocked(
 /// [`StateOptions::from_env`]. A process embedding the engine builds them
 /// directly, so two embedded sessions never share configuration through the
 /// environment of the process that hosts them.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StateOptions {
     /// Session identifier; scopes tab bindings and saved state.
     pub session_id: String,
+    /// Optional trusted host implementation for native browser process policy.
+    /// It owns process-tree teardown and supplies Chromium's inherited CDP pipes.
+    pub browser_spawn_supervisor: Option<Arc<dyn BrowserSpawnSupervisor>>,
+    /// Require `browser_spawn_supervisor` for local Chrome and reject attach/provider routes.
+    /// This flag alone does not create an operating-system network boundary.
+    pub require_browser_spawn_supervisor: bool,
     /// Name under which session state is saved and restored, if any.
     pub session_name: Option<String>,
     /// Comma-separated domain patterns navigation is restricted to.
@@ -742,6 +755,8 @@ impl Default for StateOptions {
     fn default() -> Self {
         Self {
             session_id: "default".to_string(),
+            browser_spawn_supervisor: None,
+            require_browser_spawn_supervisor: false,
             session_name: None,
             allowed_domains: None,
             pin_tab: false,
@@ -778,6 +793,8 @@ impl StateOptions {
             .is_some_and(|b| b.pinned);
         Self {
             session_name: env::var("AGENT_BROWSER_SESSION_NAME").ok(),
+            browser_spawn_supervisor: defaults.browser_spawn_supervisor,
+            require_browser_spawn_supervisor: defaults.require_browser_spawn_supervisor,
             allowed_domains: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -821,6 +838,8 @@ impl DaemonState {
     pub fn with_options(options: StateOptions) -> Self {
         Self {
             browser: None,
+            browser_spawn_supervisor: options.browser_spawn_supervisor,
+            require_browser_spawn_supervisor: options.require_browser_spawn_supervisor,
             appium: None,
             safari_driver: None,
             webdriver_backend: None,
@@ -4184,6 +4203,15 @@ async fn auto_launch_inner(
     state: &mut DaemonState,
     plugins: Vec<crate::plugins::PluginConfig>,
 ) -> Result<(), String> {
+    if state.require_browser_spawn_supervisor
+        && (env::var("AGENT_BROWSER_CDP").is_ok()
+            || env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok()
+            || env::var("AGENT_BROWSER_PROVIDER").is_ok())
+    {
+        return Err(
+            "required browser confinement supports only locally launched Chrome".to_owned(),
+        );
+    }
     if has_active_browser_session(state) {
         close_before_implicit_relaunch(state).await?;
     }
@@ -4418,7 +4446,13 @@ async fn auto_launch_inner(
         options.prepared_nss_home = Some(prepare_nss_home(&ca.bundle)?);
     }
     state.session_setup = SessionSetup::from_launch_options(&options);
-    let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
+    let mgr = BrowserManager::launch_with_supervisor(
+        options,
+        engine.as_deref(),
+        state.browser_spawn_supervisor.clone(),
+        state.require_browser_spawn_supervisor,
+    )
+    .await?;
     state.reset_input_state();
     state.browser = Some(mgr);
     state.launch_hash = Some(hash);
@@ -5030,6 +5064,20 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let provider_name = cmd.get("provider").and_then(|v| v.as_str());
+    if state.require_browser_spawn_supervisor
+        && (cdp_url.is_some()
+            || cdp_port.is_some()
+            || auto_connect
+            || provider_name.is_some()
+            || cmd
+                .get("engine")
+                .and_then(Value::as_str)
+                .is_some_and(|engine| engine != "chrome"))
+    {
+        return Err(
+            "required browser confinement supports only locally launched Chrome".to_owned(),
+        );
+    }
     let enable_features =
         string_array_from_command(cmd, "enable").unwrap_or_else(launch_enable_features_from_env);
     let init_script_paths = string_array_from_command(cmd, "initScripts")
@@ -5432,7 +5480,15 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     write_extensions_file_from_paths(&state.session_id, launch_options.extensions.as_deref());
     state.reset_input_state();
     state.session_setup = SessionSetup::from_launch_options(&launch_options);
-    state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
+    state.browser = Some(
+        BrowserManager::launch_with_supervisor(
+            launch_options,
+            engine.as_deref(),
+            state.browser_spawn_supervisor.clone(),
+            state.require_browser_spawn_supervisor,
+        )
+        .await?,
+    );
     state.launch_hash = Some(new_hash);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
@@ -13767,6 +13823,9 @@ mod tests {
         "AGENT_BROWSER_DEFAULT_TIMEOUT",
         "AGENT_BROWSER_NO_AUTO_DIALOG",
         "AGENT_BROWSER_RESTORE_SAVE",
+        "AGENT_BROWSER_CDP",
+        "AGENT_BROWSER_AUTO_CONNECT",
+        "AGENT_BROWSER_PROVIDER",
     ];
 
     #[test]
@@ -13838,6 +13897,55 @@ mod tests {
         )
         .await;
         assert_eq!(state.input_mode, "instant");
+    }
+
+    #[tokio::test]
+    async fn required_browser_supervisor_rejects_explicit_remote_attach_before_launch() {
+        let mut state = super::DaemonState::with_options(super::StateOptions {
+            session_id: "required-supervisor".to_owned(),
+            require_browser_spawn_supervisor: true,
+            ..super::StateOptions::default()
+        });
+
+        for command in [
+            serde_json::json!({"cdpUrl": "ws://127.0.0.1:9222/devtools/browser/test"}),
+            serde_json::json!({"cdpPort": 9222}),
+            serde_json::json!({"autoConnect": true}),
+            serde_json::json!({"provider": "browserless"}),
+            serde_json::json!({"engine": "lightpanda"}),
+        ] {
+            let error = super::handle_launch_inner(&command, &mut state)
+                .await
+                .expect_err("required supervision supports only local Chrome");
+            assert!(error.contains("only locally launched Chrome"));
+            assert!(state.browser.is_none(), "rejected attach must not launch");
+        }
+    }
+
+    #[tokio::test]
+    async fn required_browser_supervisor_rejects_environment_attach_before_launch() {
+        let guard = crate::test_utils::EnvGuard::new(STATE_ENV);
+        let mut state = super::DaemonState::with_options(super::StateOptions {
+            session_id: "required-supervisor".to_owned(),
+            require_browser_spawn_supervisor: true,
+            ..super::StateOptions::default()
+        });
+
+        for (key, value) in [
+            (
+                "AGENT_BROWSER_CDP",
+                "ws://127.0.0.1:9222/devtools/browser/test",
+            ),
+            ("AGENT_BROWSER_AUTO_CONNECT", "1"),
+            ("AGENT_BROWSER_PROVIDER", "browserless"),
+        ] {
+            guard.set(key, value);
+            let error = super::auto_launch_inner(&mut state, Vec::new())
+                .await
+                .expect_err("required supervision supports only locally launched Chrome");
+            assert!(error.contains("only locally launched Chrome"));
+            assert!(state.browser.is_none(), "rejected attach must not launch");
+        }
     }
 
     #[tokio::test]

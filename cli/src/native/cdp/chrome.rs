@@ -10,11 +10,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::discovery::discover_cdp_url;
+use super::process::{
+    spawn_chrome_process, BrowserChildProcess, BrowserControlPipe, BrowserControlTransport,
+    BrowserLaunchSpec, BrowserSpawnSupervisor,
+};
 use crate::ca_bundle::CaBundle;
 
 pub struct ChromeProcess {
-    child: Child,
+    child: ChromeChild,
     pub ws_url: String,
+    control_pipe: std::sync::Mutex<Option<BrowserControlPipe>>,
+    supervised_pipe: bool,
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
     temp_user_data_dir: Option<PathBuf>,
     temp_nss_home: Option<PreparedNssHome>,
     /// On Unix, the process group ID used to kill the entire Chrome process tree.
@@ -24,6 +31,79 @@ pub struct ChromeProcess {
     /// hosts. Dropped (and killed) after the Chrome tree is torn down.
     #[cfg(target_os = "linux")]
     xvfb: Option<XvfbServer>,
+}
+
+enum ChromeChild {
+    Standard(std::sync::Mutex<Child>),
+    Supervised(std::sync::Mutex<Box<dyn BrowserChildProcess>>),
+}
+
+impl ChromeChild {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Standard(child) => child.lock().unwrap_or_else(|e| e.into_inner()).id(),
+            Self::Supervised(child) => child.lock().unwrap_or_else(|e| e.into_inner()).id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Standard(child) => child
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_wait(),
+            Self::Supervised(child) => child
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_wait(),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            Self::Standard(child) => child.get_mut().unwrap_or_else(|e| e.into_inner()).wait(),
+            Self::Supervised(child) => child.get_mut().unwrap_or_else(|e| e.into_inner()).wait(),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+        match self {
+            Self::Standard(child) => {
+                let child = child.get_mut().unwrap_or_else(|e| e.into_inner());
+                #[cfg(windows)]
+                {
+                    child.stderr.take().map(|stderr| Box::new(stderr) as _)
+                }
+                #[cfg(not(windows))]
+                {
+                    child.stderr.take().map(|stderr| Box::new(stderr) as _)
+                }
+            }
+            Self::Supervised(child) => child
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_stderr(),
+        }
+    }
+
+    fn terminate_tree(&mut self) {
+        match self {
+            Self::Standard(child) => {
+                let child = child.get_mut().unwrap_or_else(|e| e.into_inner());
+                let _ = child.kill();
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+            }
+            Self::Supervised(child) => {
+                let child = child.get_mut().unwrap_or_else(|e| e.into_inner());
+                let _ = child.terminate_tree();
+                let _ = child.wait();
+            }
+        }
+    }
 }
 
 struct PreparedNssHomeInner {
@@ -61,19 +141,34 @@ impl PreparedNssHome {
 }
 
 impl ChromeProcess {
+    pub(crate) fn take_control_pipe(&mut self) -> Option<BrowserControlPipe> {
+        self.control_pipe
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    pub(crate) fn has_control_pipe(&self) -> bool {
+        self.supervised_pipe
+    }
+
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
+        self.child.terminate_tree();
         // On Unix, kill the entire process group to ensure Chrome helper
         // processes (GPU, renderer, utility, crashpad) are also terminated.
         // This prevents orphaned Chrome processes from blocking the user's
         // normal Chrome (issue #1113).
         #[cfg(unix)]
-        if let Some(pgid) = self.pgid {
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
+        if matches!(&self.child, ChromeChild::Standard(_)) {
+            if let Some(pgid) = self.pgid {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
             }
         }
-        let _ = self.child.wait();
+        if let Some(stderr_drain) = self.stderr_drain.take() {
+            let _ = stderr_drain.join();
+        }
     }
 
     /// Returns the OS process ID of the Chrome child process.
@@ -96,7 +191,15 @@ impl ChromeProcess {
 
         while start.elapsed() < timeout {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => {
+                    if matches!(&self.child, ChromeChild::Supervised(_)) {
+                        self.child.terminate_tree();
+                        if let Some(stderr_drain) = self.stderr_drain.take() {
+                            let _ = stderr_drain.join();
+                        }
+                    }
+                    return;
+                }
                 Ok(None) => std::thread::sleep(poll_interval),
                 Err(_) => break,
             }
@@ -435,6 +538,13 @@ struct ChromeArgs {
 }
 
 fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+    build_chrome_args_for_transport(options, BrowserControlTransport::WebSocket)
+}
+
+fn build_chrome_args_for_transport(
+    options: &LaunchOptions,
+    control_transport: BrowserControlTransport,
+) -> Result<ChromeArgs, String> {
     // Chrome only honors the last --enable-features switch on the command
     // line, so every feature must be collected into a single flag.
     let mut enable_features: Vec<String> = vec![
@@ -463,12 +573,24 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
                 }
             }
         } else {
+            if control_transport == BrowserControlTransport::InheritedPipe
+                && (arg.starts_with("--remote-debugging-port")
+                    || arg.starts_with("--remote-debugging-pipe")
+                    || arg.starts_with("--remote-debugging-io-pipes"))
+            {
+                return Err("custom remote debugging arguments are not allowed with supervised pipe launches".to_owned());
+            }
             user_args.push(arg.clone());
         }
     }
 
+    let remote_debugging_arg = match control_transport {
+        BrowserControlTransport::WebSocket => "--remote-debugging-port=0",
+        BrowserControlTransport::InheritedPipe if cfg!(windows) => "--remote-debugging-io-pipes",
+        BrowserControlTransport::InheritedPipe => "--remote-debugging-pipe",
+    };
     let mut args = vec![
-        "--remote-debugging-port=0".to_string(),
+        remote_debugging_arg.to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-background-networking".to_string(),
@@ -716,6 +838,14 @@ fn terminate_launched_chrome(child: &mut Child) {
 }
 
 pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
+    launch_chrome_with_supervisor(options, None, false)
+}
+
+pub fn launch_chrome_with_supervisor(
+    options: &LaunchOptions,
+    supervisor: Option<Arc<dyn BrowserSpawnSupervisor>>,
+    required: bool,
+) -> Result<ChromeProcess, String> {
     let chrome_path = match &options.executable_path {
         Some(p) => PathBuf::from(p),
         None => find_chrome().ok_or_else(|| {
@@ -759,11 +889,22 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
 
     let effective_options = resolved_options.as_ref().unwrap_or(options);
 
+    let use_supervisor = supervisor.is_some() || required;
     let max_attempts = 3;
     let mut last_err = String::new();
 
     for attempt in 1..=max_attempts {
-        match try_launch_chrome(&chrome_path, effective_options) {
+        let launch_result = if use_supervisor {
+            try_launch_chrome_supervised(
+                &chrome_path,
+                effective_options,
+                supervisor.clone(),
+                required,
+            )
+        } else {
+            try_launch_chrome(&chrome_path, effective_options)
+        };
+        match launch_result {
             Ok(mut process) => {
                 // Transfer profile temp dir ownership to ChromeProcess for cleanup on Drop.
                 // The try_launch_chrome temp_user_data_dir is None here because we set profile
@@ -796,6 +937,117 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     }
 
     Err(last_err)
+}
+
+fn try_launch_chrome_supervised(
+    chrome_path: &Path,
+    options: &LaunchOptions,
+    supervisor: Option<Arc<dyn BrowserSpawnSupervisor>>,
+    required: bool,
+) -> Result<ChromeProcess, String> {
+    let ChromeArgs {
+        args,
+        user_data_dir: _,
+        temp_user_data_dir,
+    } = build_chrome_args_for_transport(options, BrowserControlTransport::InheritedPipe)?;
+    let cleanup_temp_dir = |dir: &Option<PathBuf>| {
+        if let Some(dir) = dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let temp_nss_home = match resolve_prepared_nss_home(options) {
+        Ok(home) => home,
+        Err(error) => {
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(error);
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let temp_nss_home: Option<PreparedNssHome> = None;
+    #[cfg(target_os = "linux")]
+    let xvfb = maybe_start_xvfb(options);
+
+    let mut environment = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Some(ref xvfb) = xvfb {
+        environment.push(("DISPLAY".into(), xvfb.display.clone().into()));
+        environment.push(("XAUTHORITY".into(), xvfb.auth_file.clone().into()));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ref home) = temp_nss_home {
+        environment.push(("HOME".into(), home.path().as_os_str().to_owned()));
+        environment.push((
+            "XDG_DATA_HOME".into(),
+            home.path().join(".local/share").into_os_string(),
+        ));
+    }
+
+    let spec = BrowserLaunchSpec::new(
+        chrome_path.to_path_buf(),
+        args,
+        environment,
+        options.effectively_headless(),
+        BrowserControlTransport::InheritedPipe,
+    );
+    let mut child = match spawn_chrome_process(spec, supervisor, required, |_| {
+        Err("supervised Chrome launch has no standard-spawn fallback".to_owned())
+    }) {
+        Ok(child) => child,
+        Err(error) => {
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(error);
+        }
+    };
+    let mut stderr_drain = match child.take_stderr() {
+        Some(mut stderr) => match std::thread::Builder::new()
+            .name("agent-browser-chrome-stderr".to_owned())
+            .spawn(move || {
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            }) {
+            Ok(reader) => Some(reader),
+            Err(error) => {
+                let _ = child.terminate_tree();
+                cleanup_temp_dir(&temp_user_data_dir);
+                return Err(format!("failed to drain supervised Chrome stderr: {error}"));
+            }
+        },
+        None => None,
+    };
+    let pipe = match child.take_control_pipe() {
+        Ok(Some(pipe)) => pipe,
+        Ok(None) => {
+            let _ = child.terminate_tree();
+            if let Some(stderr_drain) = stderr_drain.take() {
+                let _ = stderr_drain.join();
+            }
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err("supervisor did not return Chromium's inherited DevTools pipes".to_owned());
+        }
+        Err(error) => {
+            let _ = child.terminate_tree();
+            if let Some(stderr_drain) = stderr_drain.take() {
+                let _ = stderr_drain.join();
+            }
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(format!(
+                "failed to take Chromium's inherited DevTools pipes: {error}"
+            ));
+        }
+    };
+    Ok(ChromeProcess {
+        child: ChromeChild::Supervised(std::sync::Mutex::new(child)),
+        ws_url: String::new(),
+        control_pipe: std::sync::Mutex::new(Some(pipe)),
+        supervised_pipe: true,
+        stderr_drain,
+        temp_user_data_dir,
+        temp_nss_home,
+        #[cfg(unix)]
+        pgid: None,
+        #[cfg(target_os = "linux")]
+        xvfb,
+    })
 }
 
 fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<ChromeProcess, String> {
@@ -919,8 +1171,11 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     };
 
     Ok(ChromeProcess {
-        child,
+        child: ChromeChild::Standard(std::sync::Mutex::new(child)),
         ws_url,
+        control_pipe: std::sync::Mutex::new(None),
+        supervised_pipe: false,
+        stderr_drain: None,
         temp_user_data_dir,
         temp_nss_home,
         #[cfg(unix)]
@@ -1779,6 +2034,50 @@ fn expand_tilde(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_launch_keeps_websocket_control_transport() {
+        let result = build_chrome_args(&LaunchOptions::default()).unwrap();
+        assert!(result
+            .args
+            .iter()
+            .any(|arg| arg == "--remote-debugging-port=0"));
+        assert!(!result.args.iter().any(|arg| {
+            arg == "--remote-debugging-pipe" || arg.starts_with("--remote-debugging-io-pipes")
+        }));
+        let _ = std::fs::remove_dir_all(result.temp_user_data_dir.unwrap());
+    }
+
+    #[test]
+    fn inherited_pipe_launch_disables_tcp_cdp_and_rejects_user_overrides() {
+        let options = LaunchOptions::default();
+        let result =
+            build_chrome_args_for_transport(&options, BrowserControlTransport::InheritedPipe)
+                .unwrap();
+        let expected = if cfg!(windows) {
+            "--remote-debugging-io-pipes"
+        } else {
+            "--remote-debugging-pipe"
+        };
+        assert!(result.args.iter().any(|arg| arg == expected));
+        assert!(!result
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("--remote-debugging-port")));
+        let _ = std::fs::remove_dir_all(result.temp_user_data_dir.unwrap());
+
+        for arg in ["--remote-debugging-port=9222", "--remote-debugging-pipe"] {
+            let options = LaunchOptions {
+                args: vec![arg.to_owned()],
+                ..Default::default()
+            };
+            assert!(build_chrome_args_for_transport(
+                &options,
+                BrowserControlTransport::InheritedPipe,
+            )
+            .is_err());
+        }
+    }
     use crate::test_utils::EnvGuard;
 
     #[test]
@@ -2383,8 +2682,11 @@ mod tests {
             // logic by creating a small helper process.
             let child = spawn_noop_child();
             let _process = ChromeProcess {
-                child,
+                child: ChromeChild::Standard(std::sync::Mutex::new(child)),
                 ws_url: String::new(),
+                control_pipe: std::sync::Mutex::new(None),
+                supervised_pipe: false,
+                stderr_drain: None,
                 temp_user_data_dir: Some(dir.clone()),
                 temp_nss_home: None,
                 #[cfg(unix)]
