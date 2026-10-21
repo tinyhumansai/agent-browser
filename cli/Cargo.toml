@@ -1,6 +1,6 @@
 [package]
 name = "agent-browser"
-version = "0.38.1"
+version = "0.39.1"
 edition = "2021"
 description = "Fast browser automation CLI for AI agents"
 license = "Apache-2.0"
@@ -23,6 +23,9 @@ rustls = { version = "0.23", default-features = false }
 # RUSTSEC-2025-0134): rustls already depends on rustls-pki-types, and its
 # `PemObject::pem_reader_iter` covers the same preamble-skipping PEM parse.
 rustls-pki-types = { version = "1", features = ["std"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 futures-util = "0.3"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
