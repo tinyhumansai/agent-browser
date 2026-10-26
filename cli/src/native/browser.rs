@@ -4379,13 +4379,15 @@ mod tests {
 
         // Keep sending requests so idle is never reached
         tokio::spawn(async move {
-            for i in 0u64.. {
+            let mut i = 0u64;
+            loop {
                 let _ = tx.send(cdp_event(
                     "Network.requestWillBeSent",
                     session,
                     json!({ "requestId": format!("r{}", i) }),
                 ));
                 sleep(Duration::from_millis(100)).await;
+                i = i.wrapping_add(1);
             }
         });
 
