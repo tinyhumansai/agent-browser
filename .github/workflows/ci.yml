@@ -138,8 +138,7 @@ jobs:
         run: pnpm --filter @agent-browser/eve test
 
   rust-cross:
-    if: github.event_name != 'pull_request'
-    timeout-minutes: 45
+    name: Rust (${{ matrix.os }} - ${{ matrix.target }})
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
