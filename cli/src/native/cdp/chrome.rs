@@ -1011,6 +1011,12 @@ fn try_launch_chrome_supervised(
         options.effectively_headless(),
         BrowserControlTransport::InheritedPipe,
     );
+    if let Some(supervisor) = supervisor.as_ref() {
+        if let Err(error) = supervisor.preflight(&spec) {
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(error);
+        }
+    }
     let mut child = match supervisor {
         Some(supervisor) => match supervisor.spawn(spec) {
             Ok(child) => child,
