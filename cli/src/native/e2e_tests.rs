@@ -6729,41 +6729,6 @@ async fn e2e_snapshot_selector_no_duplicates() {
     assert_success(&resp);
 }
 
-// ---------------------------------------------------------------------------
-// Helper: tiny HTTP server that echoes request headers as JSON
-// ---------------------------------------------------------------------------
-
-/// Starts a TCP listener on localhost:0 and spawns a task that accepts
-/// connections, reads the HTTP request, and responds with a JSON body
-/// containing all received request headers. Returns the server's base URL.
-async fn start_link_fixture_server() -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}/", listener.local_addr().unwrap());
-
-    let handle = tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let mut buf = vec![0u8; 4096];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let body = if request.starts_with("GET /next ") {
-                "<!doctype html><title>Next</title><h1>Next page</h1>"
-            } else {
-                "<!doctype html><title>Example Domain</title><h1>Example Domain</h1>\
-                 <a href=\"/next\">Next page</a>"
-            };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body,
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
-    });
-
-    (base_url, handle)
-}
-
 async fn start_echo_server() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
