@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -94,17 +95,38 @@ fn seed_running_dashboard(tmp: &TempDir, port: u16, allowed_origins: &[&str]) ->
     RunningDashboard(child)
 }
 
+/// Runs the CLI with stdout/stderr redirected to files instead of pipes.
+///
+/// `dashboard start` leaves a detached server running. On Windows that server
+/// inherits the CLI's inheritable handles, including the write ends of the
+/// pipes `Command::output()` creates, so `output()` never sees EOF and the
+/// test hangs until the server dies. Files have no EOF to wait for.
 fn run_dashboard(tmp: &TempDir, args: &[&str]) -> Output {
+    static RUN: AtomicUsize = AtomicUsize::new(0);
     let socket_dir = socket_dir(tmp);
     std::fs::create_dir_all(&socket_dir).unwrap();
+    let capture_dir = tmp.path().join("capture");
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    let id = RUN.fetch_add(1, Ordering::SeqCst);
+    let out_path = capture_dir.join(format!("{id}.stdout"));
+    let err_path = capture_dir.join(format!("{id}.stderr"));
 
-    Command::new(BIN)
+    let status = Command::new(BIN)
         .args(args)
         .env("AGENT_BROWSER_SOCKET_DIR", socket_dir)
         .env_remove("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS")
         .env("NO_COLOR", "1")
-        .output()
-        .expect("failed to invoke agent-browser dashboard")
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .status()
+        .expect("failed to invoke agent-browser dashboard");
+
+    Output {
+        status,
+        stdout: std::fs::read(&out_path).unwrap_or_default(),
+        stderr: std::fs::read(&err_path).unwrap_or_default(),
+    }
 }
 
 fn json_output(output: &Output) -> Value {
