@@ -1305,9 +1305,54 @@ async fn e2e_stream_command_requires_same_origin_before_daemon_relay() {
 // Snapshot with refs and ref-based click
 // ---------------------------------------------------------------------------
 
+async fn start_snapshot_ref_server() -> (String, tokio::task::JoinHandle<()>) {
+    const ROOT_PAGE: &str = r#"<!doctype html>
+<html><head><title>Example Domain</title></head>
+<body><main><h1>Example Domain</h1>
+<p>This page is a local snapshot fixture.</p>
+<a href="/more-information">More information...</a>
+</main></body></html>"#;
+    const DESTINATION_PAGE: &str = r#"<!doctype html>
+<html><head><title>More Information</title></head>
+<body><main><h1>More Information</h1></main></body></html>"#;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                let n = stream.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, body) = match path {
+                    "/" => ("200 OK", ROOT_PAGE),
+                    "/more-information" => ("200 OK", DESTINATION_PAGE),
+                    _ => ("404 Not Found", "Not found"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}/"), server)
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_snapshot_and_click_ref() {
+    let (fixture_url, fixture_server) = start_snapshot_ref_server().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -1318,7 +1363,7 @@ async fn e2e_snapshot_and_click_ref() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": fixture_url }),
         &mut state,
     )
     .await;
@@ -1329,14 +1374,14 @@ async fn e2e_snapshot_and_click_ref() {
     assert_success(&resp);
     let snapshot = get_data(&resp)["snapshot"].as_str().unwrap();
     assert!(
-        snapshot.contains("Example Domain"),
-        "Snapshot should contain heading"
+        snapshot.contains("heading \"Example Domain\""),
+        "Snapshot should contain the Example Domain heading, got:\n{snapshot}"
     );
     assert!(snapshot.contains("ref=e1"), "Snapshot should have ref e1");
     assert!(snapshot.contains("ref=e2"), "Snapshot should have ref e2");
     assert!(
-        snapshot.contains("link"),
-        "Snapshot should have a link element"
+        snapshot.contains("link \"More information...\" [ref=e2]"),
+        "Snapshot should have the More information link at e2, got:\n{snapshot}"
     );
 
     // Click the link by ref (e2 is the "More information..." link)
@@ -1355,13 +1400,14 @@ async fn e2e_snapshot_and_click_ref() {
     assert_success(&resp);
     let url = get_data(&resp)["url"].as_str().unwrap();
     assert!(
-        url.contains("iana.org"),
-        "Should have navigated to iana.org, got: {}",
+        url.ends_with("/more-information"),
+        "Should have navigated to the local destination, got: {}",
         url
     );
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
+    fixture_server.abort();
 }
 
 #[tokio::test]
@@ -9056,7 +9102,7 @@ async fn e2e_recording_cursor_stays_aligned_during_drag() {
     let mut measured = 0;
     let mut worst = 0;
     let mut positions = std::collections::HashSet::new();
-    for bytes in output.stdout.chunks_exact(640 * 80 * 3) {
+    for bytes in output.stdout.as_chunks::<{ 640 * 80 * 3 }>().0 {
         let frame = image::RgbImage::from_raw(640, 80, bytes.to_vec()).unwrap();
         let line = (0..640).find(|&x| {
             let [r, g, b] = frame.get_pixel(x, 0).0;
