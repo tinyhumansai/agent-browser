@@ -43,8 +43,11 @@ mod read;
 mod skills;
 #[cfg(test)]
 mod test_utils;
+mod tls;
 mod upgrade;
 mod validation;
 
+#[cfg(test)]
+pub(crate) use cli::attach_obscura_proxy_bypass;
 pub use native::actions::{execute_command, DaemonState, StateOptions};
 pub use native::policy::{ActionPolicy, ConfirmActions};

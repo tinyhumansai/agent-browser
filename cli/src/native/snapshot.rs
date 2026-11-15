@@ -374,6 +374,9 @@ pub async fn take_snapshot(
                 .object_id
                 .ok_or_else(|| format!("Selector '{}' did not match any element", selector))?;
 
+            // Request the full DOM subtree, including shadow roots, so we can
+            // collect all backendNodeIds under the matched element. Keep the
+            // parameters in one helper shared with its regression test.
             let describe: Value = client
                 .send_command(
                     "DOM.describeNode",
@@ -443,18 +446,23 @@ pub async fn take_snapshot(
             .map(|n| n.backend_node_id.is_some_and(|bid| id_set.contains(&bid)))
             .collect();
 
-        // An AX node is a "top-level" match if it is in the subtree but its
-        // parent (in the AX tree) is not.
-        let mut roots = Vec::new();
-        for (idx, node) in tree_nodes.iter().enumerate() {
-            if !in_subtree[idx] {
-                continue;
+        // An AX node is a "top-level" match if it is in the subtree but none
+        // of its ancestors (in the AX tree) are. Checking only the parent is
+        // not enough: ignored nodes lose their backendDOMNodeId in
+        // build_tree, so a wrapper <div> between two matched nodes would
+        // turn everything below it into an extra root and render it twice.
+        let has_ancestor_in_subtree = |mut idx: usize| {
+            while let Some(pidx) = tree_nodes[idx].parent_idx {
+                if in_subtree[pidx] {
+                    return true;
+                }
+                idx = pidx;
             }
-            let parent_in_subtree = node.parent_idx.is_some_and(|pidx| in_subtree[pidx]);
-            if !parent_in_subtree {
-                roots.push(idx);
-            }
-        }
+            false
+        };
+        let roots: Vec<usize> = (0..tree_nodes.len())
+            .filter(|&idx| in_subtree[idx] && !has_ancestor_in_subtree(idx))
+            .collect();
 
         if roots.is_empty() {
             return Err(format!(
