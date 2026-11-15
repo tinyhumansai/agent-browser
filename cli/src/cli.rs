@@ -1999,12 +1999,7 @@ pub fn main() {
     // Handle batch command: from args or stdin
     if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
         let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
-        let arg_commands = cmd.get("commands").and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(commands::shell_words_split)
-                .collect::<Vec<Vec<String>>>()
-        });
+        let arg_commands = batch_commands_from_command(&cmd);
         run_batch(&flags, &daemon_opts, bail, arg_commands);
         return;
     }
@@ -2228,6 +2223,18 @@ fn batch_requires_local_launch_config(flags: &Flags, commands: &[Vec<String>]) -
             })
             .is_some_and(|action| action != "read")
     })
+}
+
+fn batch_commands_from_command(cmd: &serde_json::Value) -> Option<Vec<Vec<String>>> {
+    cmd.get("commands")
+        .and_then(|value| value.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|value| value.as_str())
+                .map(commands::shell_words_split)
+                .collect()
+        })
+        .or_else(|| serde_json::from_value(cmd.get("argv")?.clone()).ok())
 }
 
 /// Read batch commands given on stdin as a JSON array of string arrays.
@@ -2753,6 +2760,21 @@ mod tests {
                 vec!["open".to_string(), "https://example.test".to_string()]
             ]
         ));
+    }
+
+    #[test]
+    fn stdin_batch_dispatch_uses_commands_buffered_before_launch() {
+        let command = json!({
+            "action": "batch",
+            "argv": [["read", "https://example.test"], ["snapshot"]],
+        });
+        assert_eq!(
+            batch_commands_from_command(&command),
+            Some(vec![
+                vec!["read".to_owned(), "https://example.test".to_owned()],
+                vec!["snapshot".to_owned()],
+            ])
+        );
     }
 
     #[test]

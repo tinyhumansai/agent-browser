@@ -1,9 +1,7 @@
 ---
-title: "Native Mode"
-navTitle: "Native Mode"
+title: "Embedding the Native Engine"
+navTitle: "Embedding"
 ---
-
-# Embedding the Native Engine
 
 Hosts can run the native engine in-process by creating a `DaemonState` with `DaemonState::with_options` and sending the same JSON commands used by the daemon to `execute_command`. `StateOptions` keeps configuration scoped to each embedded session instead of reading shared `AGENT_BROWSER_*` variables.
 
