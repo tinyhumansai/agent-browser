@@ -38,6 +38,11 @@ enum ChromeChild {
     Supervised(std::sync::Mutex<Box<dyn BrowserChildProcess>>),
 }
 
+fn terminate_and_reap(child: &mut dyn BrowserChildProcess) {
+    let _ = child.terminate_tree();
+    let _ = child.wait();
+}
+
 impl ChromeChild {
     fn id(&self) -> u32 {
         match self {
@@ -1048,8 +1053,7 @@ fn try_launch_chrome_supervised(
     let pipe = match child.take_control_pipe() {
         Ok(Some(pipe)) => pipe,
         Ok(None) => {
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            terminate_and_reap(child.as_mut());
             if let Some(stderr_drain) = stderr_drain.take() {
                 let _ = stderr_drain.join();
             }
@@ -1057,8 +1061,7 @@ fn try_launch_chrome_supervised(
             return Err("supervisor did not return Chromium's inherited DevTools pipes".to_owned());
         }
         Err(error) => {
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            terminate_and_reap(child.as_mut());
             if let Some(stderr_drain) = stderr_drain.take() {
                 let _ = stderr_drain.join();
             }
@@ -2121,6 +2124,48 @@ fn expand_tilde(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervised_startup_failure_terminates_and_reaps_child() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Probe {
+            terminated: Arc<AtomicBool>,
+            waited: Arc<AtomicBool>,
+        }
+        impl BrowserChildProcess for Probe {
+            fn id(&self) -> u32 {
+                1
+            }
+            fn take_stderr(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+                None
+            }
+            fn take_control_pipe(&mut self) -> Result<Option<BrowserControlPipe>, String> {
+                Ok(None)
+            }
+            fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+                Ok(None)
+            }
+            fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+                self.waited.store(true, Ordering::SeqCst);
+                Err(std::io::Error::other("probe"))
+            }
+            fn terminate_tree(&mut self) -> std::io::Result<()> {
+                self.terminated.store(true, Ordering::SeqCst);
+                Err(std::io::Error::other("probe"))
+            }
+        }
+
+        let terminated = Arc::new(AtomicBool::new(false));
+        let waited = Arc::new(AtomicBool::new(false));
+        let mut child = Probe {
+            terminated: Arc::clone(&terminated),
+            waited: Arc::clone(&waited),
+        };
+        terminate_and_reap(&mut child);
+        assert!(terminated.load(Ordering::SeqCst));
+        assert!(waited.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn default_launch_keeps_websocket_control_transport() {
