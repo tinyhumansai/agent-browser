@@ -7,6 +7,13 @@
 //! [`DaemonState`], built from [`StateOptions`] rather than from the
 //! `AGENT_BROWSER_*` environment variables the daemon reads.
 //!
+//! Embedded hosts that need OS-enforced browser policy can provide a
+//! [`BrowserSpawnSupervisor`] and set
+//! [`StateOptions::require_browser_spawn_supervisor`]. The supervisor owns
+//! process-tree teardown and the inherited CDP pipes. It must implement
+//! platform-specific native confinement itself; the required flag and pipe
+//! transport do not create a network boundary.
+//!
 //! ```no_run
 //! # async fn demo() {
 //! use agent_browser::{execute_command, DaemonState, StateOptions};
@@ -50,4 +57,8 @@ mod validation;
 #[cfg(test)]
 pub(crate) use cli::attach_obscura_proxy_bypass;
 pub use native::actions::{execute_command, DaemonState, StateOptions};
+pub use native::cdp::process::{
+    BrowserChildProcess, BrowserControlPipe, BrowserControlPipeControl, BrowserControlTransport,
+    BrowserLaunchSpec, BrowserSpawnSupervisor,
+};
 pub use native::policy::{ActionPolicy, ConfirmActions};

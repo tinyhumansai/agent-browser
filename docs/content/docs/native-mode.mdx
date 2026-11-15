@@ -1,8 +1,12 @@
 ---
-title: "Native Mode"
-navTitle: "Native Mode"
+title: "Embedding the Native Engine"
+navTitle: "Embedding"
 ---
 
-agent-browser is now 100% native Rust by default. The Node.js/Playwright daemon has been removed.
+Hosts can run the native engine in-process by creating a `DaemonState` with `DaemonState::with_options` and sending the same JSON commands used by the daemon to `execute_command`. `StateOptions` keeps configuration scoped to each embedded session instead of reading shared `AGENT_BROWSER_*` variables.
 
-This page is no longer relevant. See the main [documentation](/) for current architecture and usage.
+## Supervising Chrome processes
+
+An embedding host can set `StateOptions::browser_spawn_supervisor` to a trusted `BrowserSpawnSupervisor` and set `require_browser_spawn_supervisor` to require it for local Chrome launches. The supervisor receives a `BrowserLaunchSpec`, owns the Chrome process tree, and supplies the parent ends of Chromium's inherited DevTools control pipes. CDP then uses those pipes directly rather than opening a WebSocket control port.
+
+The supervisor must reject unsupported isolation and pipe capabilities during `preflight`, before spawning any process. Unix implementations must provide Chrome's pipe endpoints as file descriptors 3 and 4 and cancellable nonblocking parent IO. Windows implementations must pass only the specified child pipe handles through the process handle allowlist. The inherited pipe transport does not provide network isolation; the embedding host is responsible for establishing and verifying its native security boundary. Remote CDP, auto-connect, provider, and non-Chrome routes are rejected when supervision is required.
