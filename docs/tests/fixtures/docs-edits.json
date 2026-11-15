@@ -2,6 +2,14 @@
   "pages": {
     "/commands": [
       {
+        "from": "--args <args>            # Browser launch args (comma separated)",
+        "to": "--args <args>            # Browser launch args (commas inside a value are kept)"
+      },
+      {
+        "from": "agent-browser wait --load networkidle # Use only for pages known to become quiet",
+        "to": "agent-browser wait --load networkidle # Use only for pages known to become quiet\nagent-browser wait --load networkquiet # Wait for the requests that change the page"
+      },
+      {
         "from": "# Trust a CA for locally launched Chromium on Linux",
         "to": "# Trust a CA for CLI requests, and for local Chromium on Linux"
       },
@@ -12,8 +20,18 @@
     ],
     "/configuration": [
       {
+        "from": "Comma or newline separated browser launch arguments.",
+        "to": "Browser launch arguments, separated by newlines or by commas before another flag. Commas inside a value are kept."
+      },
+      {
         "from": "This initial implementation does not support",
         "to": "Browser trust does not support"
+      }
+    ],
+    "/cdp-mode": [
+      {
+        "from": "Browser launch args (comma-separated)",
+        "to": "Browser launch args. Commas inside a value are kept."
       }
     ],
     "/proxy": [

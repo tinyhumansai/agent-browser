@@ -1065,3 +1065,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "install_archive_tests.rs"]
+mod install_archive_tests;

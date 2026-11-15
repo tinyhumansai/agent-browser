@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, posix } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,7 +11,7 @@ import ts from "typescript";
 
 const commit = "efee3893d9080fcacb1aa6c9a21d13fbc6021f20";
 const root = fileURLToPath(new URL("../../", import.meta.url));
-const output = new URL("../tests/fixtures/docs-baseline.json", import.meta.url);
+const output = new URL("../tests/fixtures/docs-baseline.json.gz", import.meta.url);
 const git = (...args) =>
   execFileSync("git", args, { cwd: root, maxBuffer: 16 * 1024 * 1024 });
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -323,11 +324,15 @@ const serialized = `${JSON.stringify(
   2,
 )}\n`;
 if (process.argv.includes("--check")) {
+  const compressed = await readFile(output);
   assert.equal(
-    await readFile(output, "utf8"),
+    gunzipSync(compressed, {
+      maxOutputLength: 16 * 1024 * 1024,
+    }).toString("utf8"),
     serialized,
     "Baseline is not reproducible from aff6125",
   );
+  assert.deepEqual(compressed, gzipSync(serialized, { level: 9 }));
   console.log(
     `PASS: ${pages.length} fixtures reproduce exactly from ${commit}`,
   );
@@ -338,7 +343,7 @@ if (process.argv.includes("--check")) {
     "Only --check is supported; the baseline commit cannot be overridden",
   );
   await mkdir(dirname(fileURLToPath(output)), { recursive: true });
-  await writeFile(output, serialized);
+  await writeFile(output, gzipSync(serialized, { level: 9 }));
   console.log(
     `Captured ${pages.length} original pages and ${Object.keys(sources).length} original source files at ${commit}`,
   );

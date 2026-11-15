@@ -122,6 +122,16 @@ fn attach_input_mode(cmd: &mut serde_json::Value, flags: &Flags) {
     }
 }
 
+fn attach_read_tls_options(cmd: &mut serde_json::Value, options: crate::tls::TrustOptions) {
+    cmd["tls"] = json!(options);
+}
+
+pub(crate) fn attach_obscura_proxy_bypass(cmd: &mut serde_json::Value, flags: &Flags) {
+    if flags.engine.as_deref() == Some("obscura") {
+        cmd["proxyBypass"] = json!(flags.proxy_bypass);
+    }
+}
+
 fn attach_plugins_to_command(cmd: &mut serde_json::Value, plugins: &[plugins::PluginConfig]) {
     cmd["plugins"] = json!(plugins);
 }
@@ -279,6 +289,10 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
 }
 
 fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -> bool {
+    if command.get("action").and_then(|value| value.as_str()) == Some("read") {
+        return false;
+    }
+
     (flags.headed
         || flags.cli_headed
         || flags.executable_path.is_some()
@@ -308,13 +322,6 @@ fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -
         && flags.provider.is_none()
         && !flags.auto_connect
         && !command_is_external_launch(command)
-}
-
-/// Sends this invocation's resolved Obscura bypass setting, including an explicit clear.
-fn attach_obscura_proxy_bypass(cmd: &mut serde_json::Value, flags: &Flags) {
-    if flags.engine.as_deref() == Some("obscura") {
-        cmd["proxyBypass"] = json!(flags.proxy_bypass);
-    }
 }
 
 fn attach_restore_config_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
@@ -1322,7 +1329,7 @@ fn run_close_all(flags: &Flags) {
         });
         match result {
             Ok(resp) if resp.success => {
-                tls::clear_session(session);
+                crate::tls::clear_session(session);
                 closed.push(session.clone());
             }
             Ok(resp) => {
@@ -1426,7 +1433,7 @@ pub fn main() {
         env::set_var("AGENT_BROWSER_NAMESPACE", namespace);
     }
     let clean = clean_args(&args);
-    tls::configure_process(&flags);
+    crate::tls::configure_process(&flags);
 
     let has_help = args.iter().any(|a| a == "--help" || a == "-h");
     let has_version = args.iter().any(|a| a == "--version" || a == "-V");
@@ -1614,7 +1621,9 @@ pub fn main() {
         cmd["argv"] = json!(read_batch_stdin(&flags));
     }
     match cmd.get("action").and_then(|v| v.as_str()) {
-        Some("read") => cmd["tls"] = json!(tls::session_options(&flags, &flags.session)),
+        Some("read") => {
+            attach_read_tls_options(&mut cmd, tls::session_options(&flags, &flags.session))
+        }
         Some("close") => tls::clear_session(&flags.session),
         _ => {}
     }
@@ -1987,8 +1996,82 @@ pub fn main() {
         }
     }
 
+    // Handle batch command: from args or stdin
+    if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
+        let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
+        let arg_commands = cmd.get("commands").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(commands::shell_words_split)
+                .collect::<Vec<Vec<String>>>()
+        });
+        run_batch(&flags, &daemon_opts, bail, arg_commands);
+        return;
+    }
+
+    configure_local_launch(&flags, &cmd);
+
+    let output_opts = OutputOptions::from_flags(&flags);
+
+    match send_command_with_respawn(cmd.clone(), &flags.session, &daemon_opts) {
+        Ok(mut resp) => {
+            if daemon_restarted {
+                mark_restarted_background(&mut resp);
+            }
+            if flags.confirm_interactive && confirmation_prompt_from_response(&resp).is_some() {
+                resp = run_interactive_confirmations(resp, &flags, &output_opts);
+                if daemon_restarted {
+                    mark_restarted_background(&mut resp);
+                }
+                if !resp.success {
+                    exit(1);
+                }
+                return;
+            }
+            let success = resp.success;
+            // Extract action for context-specific output handling
+            let action = cmd.get("action").and_then(|v| v.as_str());
+            if success && action == Some("close") {
+                crate::tls::clear_session(&flags.session);
+            }
+            print_response_with_opts(&resp, action, &output_opts);
+            if !success {
+                exit(1);
+            }
+        }
+        Err(e) => {
+            if flags.json {
+                print_json_error(e);
+            } else {
+                eprintln!("{} {}", color::error_indicator(), e);
+            }
+            exit(1);
+        }
+    }
+}
+
+/// send_command plus the daemon-shutdown-race recovery: ensure_daemon no
+/// longer pays a settle-sleep on every invocation, so a daemon that exited
+/// right after its liveness check surfaces as an unreachable socket on the
+/// request itself. Respawn once and retry before reporting failure.
+fn send_command_with_respawn(
+    cmd: serde_json::Value,
+    session: &str,
+    daemon_opts: &DaemonOptions,
+) -> Result<connection::Response, String> {
+    let first_attempt = send_command(cmd.clone(), session);
+    match first_attempt {
+        Err(ref e) if daemon_unreachable(e) => match ensure_daemon(session, daemon_opts) {
+            Ok(_) => send_command(cmd, session),
+            Err(_) => first_attempt,
+        },
+        other => other,
+    }
+}
+
+fn configure_local_launch(flags: &Flags, command: &serde_json::Value) {
     // Launch headed browser or configure browser options (without CDP or provider)
-    if should_send_local_launch_config(&flags, &cmd) {
+    if should_send_local_launch_config(flags, command) {
         let mut launch_cmd = json!({
             "id": gen_id(),
             "action": "launch",
@@ -2003,7 +2086,7 @@ pub fn main() {
             launch_cmd["headless"] = json!(!flags.headed);
         }
         launch_cmd["plugins"] = json!(flags.plugins.clone());
-        attach_restore_config_to_command(&mut launch_cmd, &flags);
+        attach_restore_config_to_command(&mut launch_cmd, flags);
 
         let cmd_obj = launch_cmd
             .as_object_mut()
@@ -2063,7 +2146,7 @@ pub fn main() {
             launch_cmd["ignoreHTTPSErrors"] = json!(true);
         }
 
-        attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
+        attach_ca_cert_to_launch_command(&mut launch_cmd, flags);
 
         if flags.allow_file_access {
             launch_cmd["allowFileAccess"] = json!(true);
@@ -2078,7 +2161,7 @@ pub fn main() {
         if flags.webgpu || flags.cli_webgpu {
             launch_cmd["webgpu"] = json!(flags.webgpu);
         }
-        attach_webmcp_launch_option(&mut launch_cmd, &flags);
+        attach_webmcp_launch_option(&mut launch_cmd, flags);
 
         // Env-only opt-out for automatic Xvfb; always stamped from the CLI's
         // fresh environment so both setting and unsetting the var take effect
@@ -2094,7 +2177,7 @@ pub fn main() {
             launch_cmd["downloadPath"] = json!(dp);
         }
 
-        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
+        attach_allowed_domains_to_launch_command(&mut launch_cmd, flags);
 
         if let Some(ref engine) = flags.engine {
             launch_cmd["engine"] = json!(engine);
@@ -2131,77 +2214,20 @@ pub fn main() {
             }
         }
     }
-
-    // Handle batch command: from args or stdin
-    if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
-        let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
-        let arg_commands = cmd
-            .get("commands")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(commands::shell_words_split)
-                    .collect::<Vec<Vec<String>>>()
-            })
-            .or_else(|| serde_json::from_value(cmd.get("argv")?.clone()).ok());
-        run_batch(&flags, &daemon_opts, bail, arg_commands);
-        return;
-    }
-
-    let output_opts = OutputOptions::from_flags(&flags);
-
-    match send_command_with_respawn(cmd.clone(), &flags.session, &daemon_opts) {
-        Ok(mut resp) => {
-            if daemon_restarted {
-                mark_restarted_background(&mut resp);
-            }
-            if flags.confirm_interactive && confirmation_prompt_from_response(&resp).is_some() {
-                resp = run_interactive_confirmations(resp, &flags, &output_opts);
-                if daemon_restarted {
-                    mark_restarted_background(&mut resp);
-                }
-                if !resp.success {
-                    exit(1);
-                }
-                return;
-            }
-            let success = resp.success;
-            // Extract action for context-specific output handling
-            let action = cmd.get("action").and_then(|v| v.as_str());
-            print_response_with_opts(&resp, action, &output_opts);
-            if !success {
-                exit(1);
-            }
-        }
-        Err(e) => {
-            if flags.json {
-                print_json_error(e);
-            } else {
-                eprintln!("{} {}", color::error_indicator(), e);
-            }
-            exit(1);
-        }
-    }
 }
 
-/// send_command plus the daemon-shutdown-race recovery: ensure_daemon no
-/// longer pays a settle-sleep on every invocation, so a daemon that exited
-/// right after its liveness check surfaces as an unreachable socket on the
-/// request itself. Respawn once and retry before reporting failure.
-fn send_command_with_respawn(
-    cmd: serde_json::Value,
-    session: &str,
-    daemon_opts: &DaemonOptions,
-) -> Result<connection::Response, String> {
-    let first_attempt = send_command(cmd.clone(), session);
-    match first_attempt {
-        Err(ref e) if daemon_unreachable(e) => match ensure_daemon(session, daemon_opts) {
-            Ok(_) => send_command(cmd, session),
-            Err(_) => first_attempt,
-        },
-        other => other,
-    }
+fn batch_requires_local_launch_config(flags: &Flags, commands: &[Vec<String>]) -> bool {
+    commands.iter().any(|command_args| {
+        parse_command(command_args, flags)
+            .ok()
+            .and_then(|command| {
+                command
+                    .get("action")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .is_some_and(|action| action != "read")
+    })
 }
 
 /// Read batch commands given on stdin as a JSON array of string arrays.
@@ -2253,6 +2279,10 @@ fn run_batch(
         return;
     }
 
+    if batch_requires_local_launch_config(flags, &commands) {
+        configure_local_launch(flags, &json!({ "action": "batch" }));
+    }
+
     let output_opts = OutputOptions::from_flags(flags);
 
     let mut results: Vec<serde_json::Value> = Vec::new();
@@ -2292,7 +2322,9 @@ fn run_batch(
         };
         attach_input_mode(&mut parsed, flags);
         match parsed.get("action").and_then(|v| v.as_str()) {
-            Some("read") => parsed["tls"] = json!(tls::session_options(flags, &flags.session)),
+            Some("read") => {
+                attach_read_tls_options(&mut parsed, tls::session_options(flags, &flags.session))
+            }
             Some("close") => tls::clear_session(&flags.session),
             _ => {}
         }
@@ -2308,6 +2340,9 @@ fn run_batch(
 
         match send_command_with_respawn(parsed, &flags.session, daemon_opts) {
             Ok(resp) => {
+                if resp.success && action.as_deref() == Some("close") {
+                    crate::tls::clear_session(&flags.session);
+                }
                 if flags.json {
                     let mut result = json!({
                         "command": cmd_args,
@@ -2379,6 +2414,23 @@ fn run_batch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_command_forwards_resolved_tls_options() {
+        let mut command = serde_json::json!({"action":"read"});
+        super::attach_read_tls_options(
+            &mut command,
+            crate::tls::TrustOptions {
+                use_system_ca: true,
+                ca_cert: Some("/path/to/ca.pem".into()),
+                ca_cert_is_implicit: false,
+            },
+        );
+
+        assert!(command["tls"]["useSystemCa"].as_bool().unwrap_or(false));
+        assert_eq!(command["tls"]["caCert"], "/path/to/ca.pem");
+        assert!(!command["tls"]["caCertIsImplicit"].as_bool().unwrap_or(true));
+    }
+
     #[test]
     fn input_mode_session_setting_preserves_command_override() {
         let args: Vec<String> = ["--input-mode", "smooth", "click", "#button", "--human"]
@@ -2676,6 +2728,31 @@ mod tests {
 
         assert_eq!(launch["clearCaCert"], true);
         assert!(snapshot.get("clearCaCert").is_none());
+    }
+
+    #[test]
+    fn read_with_cli_ca_does_not_request_browser_launch() {
+        let mut flags = neutral_launch_config_flags();
+        flags.ca_cert = Some("/tmp/proxy-ca.pem".to_string());
+        let command = json!({ "action": "read" });
+
+        assert!(!should_send_local_launch_config(&flags, &command));
+    }
+
+    #[test]
+    fn read_only_batch_with_cli_ca_does_not_request_browser_launch() {
+        let mut flags = neutral_launch_config_flags();
+        flags.ca_cert = Some("/tmp/proxy-ca.pem".to_string());
+        let commands = vec![vec!["read".to_string(), "https://example.test".to_string()]];
+
+        assert!(!batch_requires_local_launch_config(&flags, &commands));
+        assert!(batch_requires_local_launch_config(
+            &flags,
+            &[
+                vec!["read".to_string()],
+                vec!["open".to_string(), "https://example.test".to_string()]
+            ]
+        ));
     }
 
     #[test]

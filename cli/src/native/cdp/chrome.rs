@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use super::discovery::discover_cdp_url;
 use super::process::{
-    spawn_chrome_process, BrowserChildProcess, BrowserControlPipe, BrowserControlTransport,
-    BrowserLaunchSpec, BrowserSpawnSupervisor,
+    BrowserChildProcess, BrowserControlPipe, BrowserControlTransport, BrowserLaunchSpec,
+    BrowserSpawnSupervisor,
 };
 use crate::ca_bundle::CaBundle;
 
@@ -955,6 +955,27 @@ fn try_launch_chrome_supervised(
             let _ = std::fs::remove_dir_all(dir);
         }
     };
+    let supervisor = match supervisor {
+        Some(supervisor) => {
+            let preflight_spec = BrowserLaunchSpec::new(
+                chrome_path.to_path_buf(),
+                args.clone(),
+                Vec::new(),
+                options.effectively_headless(),
+                BrowserControlTransport::InheritedPipe,
+            );
+            if let Err(error) = supervisor.preflight(&preflight_spec) {
+                cleanup_temp_dir(&temp_user_data_dir);
+                return Err(error);
+            }
+            Some(supervisor)
+        }
+        None if required => {
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err("browser launch requires a browser process supervisor".to_owned());
+        }
+        None => None,
+    };
     #[cfg(target_os = "linux")]
     let temp_nss_home = match resolve_prepared_nss_home(options) {
         Ok(home) => home,
@@ -990,13 +1011,17 @@ fn try_launch_chrome_supervised(
         options.effectively_headless(),
         BrowserControlTransport::InheritedPipe,
     );
-    let mut child = match spawn_chrome_process(spec, supervisor, required, |_| {
-        Err("supervised Chrome launch has no standard-spawn fallback".to_owned())
-    }) {
-        Ok(child) => child,
-        Err(error) => {
+    let mut child = match supervisor {
+        Some(supervisor) => match supervisor.spawn(spec) {
+            Ok(child) => child,
+            Err(error) => {
+                cleanup_temp_dir(&temp_user_data_dir);
+                return Err(error);
+            }
+        },
+        None => {
             cleanup_temp_dir(&temp_user_data_dir);
-            return Err(error);
+            return Err("supervised Chrome launch has no standard-spawn fallback".to_owned());
         }
     };
     let mut stderr_drain = match child.take_stderr() {
@@ -1018,6 +1043,7 @@ fn try_launch_chrome_supervised(
         Ok(Some(pipe)) => pipe,
         Ok(None) => {
             let _ = child.terminate_tree();
+            let _ = child.wait();
             if let Some(stderr_drain) = stderr_drain.take() {
                 let _ = stderr_drain.join();
             }
@@ -1026,6 +1052,7 @@ fn try_launch_chrome_supervised(
         }
         Err(error) => {
             let _ = child.terminate_tree();
+            let _ = child.wait();
             if let Some(stderr_drain) = stderr_drain.take() {
                 let _ = stderr_drain.join();
             }

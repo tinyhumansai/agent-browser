@@ -374,6 +374,9 @@ pub async fn take_snapshot(
                 .object_id
                 .ok_or_else(|| format!("Selector '{}' did not match any element", selector))?;
 
+            // Request the full DOM subtree, including shadow roots, so we can
+            // collect all backendNodeIds under the matched element. Keep the
+            // parameters in one helper shared with its regression test.
             let describe: Value = client
                 .send_command(
                     "DOM.describeNode",

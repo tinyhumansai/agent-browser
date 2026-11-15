@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { gunzipSync } from "node:zlib";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 
 export const baseline = JSON.parse(
-  await readFile(
-    new URL("fixtures/docs-baseline.json", import.meta.url),
-    "utf8",
-  ),
+  gunzipSync(
+    await readFile(
+      new URL("fixtures/docs-baseline.json.gz", import.meta.url),
+    ),
+    { maxOutputLength: 16 * 1024 * 1024 },
+  ).toString("utf8"),
 );
 export const { pages } = baseline;
 export const origin = "https://agent-browser.dev";

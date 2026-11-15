@@ -7,32 +7,106 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use rcgen::{
+    date_time_ymd, BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose,
+};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::Value;
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_agent-browser");
-const CA_A: &str = include_str!("fixtures/tls/ca-a.pem");
-const CA_B: &str = include_str!("fixtures/tls/ca-b.pem");
+#[derive(Clone)]
+struct TestAuthority {
+    certificate_pem: String,
+    private_key_pem: String,
+}
+
+impl TestAuthority {
+    fn new() -> Self {
+        let key = KeyPair::generate().unwrap();
+        let certificate = ca_params().self_signed(&key).unwrap();
+        Self {
+            certificate_pem: certificate.pem(),
+            private_key_pem: key.serialize_pem(),
+        }
+    }
+
+    fn localhost(&self, expired: bool) -> TestIdentity {
+        self.named(vec!["localhost".to_owned()], expired)
+    }
+
+    fn named(&self, subject_alt_names: Vec<String>, expired: bool) -> TestIdentity {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(subject_alt_names).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        if expired {
+            params.not_before = date_time_ymd(2020, 1, 1);
+            params.not_after = date_time_ymd(2021, 1, 1);
+        }
+        let issuer = Issuer::new(
+            ca_params(),
+            KeyPair::from_pem(&self.private_key_pem).unwrap(),
+        );
+        let certificate = params.signed_by(&key, &issuer).unwrap();
+        TestIdentity {
+            certificate_pem: certificate.pem(),
+            private_key_pem: key.serialize_pem(),
+        }
+    }
+}
+
+struct TestIdentity {
+    certificate_pem: String,
+    private_key_pem: String,
+}
+
+fn ca_params() -> CertificateParams {
+    let mut params = CertificateParams::default();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "agent-browser ephemeral TLS test CA");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params
+}
 
 struct TlsServer {
     port: u16,
+    certificate_pem: String,
+    authority: TestAuthority,
     requests: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl TlsServer {
-    fn new(cert: &str, key: &str) -> Self {
-        Self::with_response(cert, key, false, "TLS works\n")
+    fn new() -> Self {
+        let authority = TestAuthority::new();
+        let identity = authority.localhost(false);
+        Self::with_identity(authority, &identity, false, "TLS works\n")
     }
 
-    fn with_response(cert: &str, key: &str, proxy: bool, body: &str) -> Self {
+    fn expired(authority: TestAuthority) -> Self {
+        let identity = authority.localhost(true);
+        Self::with_identity(authority, &identity, false, "expired\n")
+    }
+
+    fn with_identity(
+        authority: TestAuthority,
+        identity: &TestIdentity,
+        proxy: bool,
+        body: &str,
+    ) -> Self {
         let response = Arc::new(format!("HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()));
-        let certs = rustls_pemfile::certs(&mut cert.as_bytes())
+        let mut cert_reader = std::io::BufReader::new(identity.certificate_pem.as_bytes());
+        let certs = CertificateDer::pem_reader_iter(&mut cert_reader)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let key = rustls_pemfile::private_key(&mut key.as_bytes())
+        let mut key_reader = std::io::BufReader::new(identity.private_key_pem.as_bytes());
+        let key = PrivateKeyDer::pem_reader_iter(&mut key_reader)
+            .next()
             .unwrap()
             .unwrap();
         let config = Arc::new(
@@ -94,6 +168,8 @@ impl TlsServer {
         });
         Self {
             port,
+            certificate_pem: authority.certificate_pem.clone(),
+            authority,
             requests,
             stopped,
             worker: Some(worker),
@@ -101,16 +177,13 @@ impl TlsServer {
     }
 
     fn a() -> Self {
-        Self::new(
-            include_str!("fixtures/tls/server-a.pem"),
-            include_str!("fixtures/tls/server-a.key"),
-        )
+        Self::new()
     }
     fn b() -> Self {
-        Self::new(
-            include_str!("fixtures/tls/server-b.pem"),
-            include_str!("fixtures/tls/server-b.key"),
-        )
+        Self::new()
+    }
+    fn certificate(&self) -> &str {
+        &self.certificate_pem
     }
     fn url(&self) -> String {
         format!("https://localhost:{}", self.port)
@@ -219,7 +292,7 @@ fn read(session: &Session, url: &str, options: &[&str], succeeds: bool) -> Value
 fn read_trust_changes_rotate_and_clear_without_browser_or_daemon_restart() {
     let (a, b) = (TlsServer::a(), TlsServer::b());
     let session = Session::new();
-    let ca = session.ca("ca.pem", CA_A);
+    let ca = session.ca("ca.pem", a.certificate());
     read(&session, &a.url(), &[], false);
     let pid = session.pid();
     read(
@@ -230,14 +303,17 @@ fn read_trust_changes_rotate_and_clear_without_browser_or_daemon_restart() {
     );
     read(&session, &a.url(), &[], true);
     read(&session, &b.url(), &[], false);
-    std::fs::write(&ca, CA_B).unwrap();
+    std::fs::write(&ca, b.certificate()).unwrap();
     read(&session, &b.url(), &[], true);
     read(&session, &a.url(), &[], false);
     std::fs::write(&ca, "invalid certificate").unwrap();
     read(&session, &b.url(), &[], false);
-    std::fs::write(&ca, CA_B).unwrap();
+    std::fs::write(&ca, b.certificate()).unwrap();
     read(&session, &b.url(), &[], true);
-    let same = session.ca("equivalent.pem", &format!("{CA_B}{CA_B}"));
+    let same = session.ca(
+        "equivalent.pem",
+        &format!("{}{}", b.certificate(), b.certificate()),
+    );
     read(
         &session,
         &b.url(),
@@ -247,7 +323,7 @@ fn read_trust_changes_rotate_and_clear_without_browser_or_daemon_restart() {
     read(&session, &b.url(), &["--no-ca-cert"], false);
     assert_eq!(session.pid(), pid);
     let other = Session::new();
-    let other_ca = other.ca("ca.pem", CA_B);
+    let other_ca = other.ca("ca.pem", b.certificate());
     read(
         &other,
         &b.url(),
@@ -261,7 +337,7 @@ fn read_trust_changes_rotate_and_clear_without_browser_or_daemon_restart() {
 fn read_trust_survives_a_daemon_restart_until_close() {
     let a = TlsServer::a();
     let session = Session::new();
-    let ca = session.ca("ca.pem", CA_A);
+    let ca = session.ca("ca.pem", a.certificate());
     read(
         &session,
         &a.url(),
@@ -279,12 +355,9 @@ fn read_trust_survives_a_daemon_restart_until_close() {
 #[test]
 fn trust_preserves_hostname_and_expiry_validation() {
     let a = TlsServer::a();
-    let expired = TlsServer::new(
-        include_str!("fixtures/tls/expired.pem"),
-        include_str!("fixtures/tls/server-a.key"),
-    );
+    let expired = TlsServer::expired(a.authority.clone());
     let session = Session::new();
-    let ca = session.ca("ca.pem", CA_A);
+    let ca = session.ca("ca.pem", a.certificate());
     read(
         &session,
         &a.url(),
@@ -307,7 +380,7 @@ fn trust_preserves_hostname_and_expiry_validation() {
 fn system_roots_refresh_and_explicit_false_overrides_environment() {
     let (a, b) = (TlsServer::a(), TlsServer::b());
     let mut session = Session::new();
-    let ca = session.ca("native.pem", CA_A);
+    let ca = session.ca("native.pem", a.certificate());
     session.system_bundle = Some(ca.clone());
     read(
         &session,
@@ -316,7 +389,7 @@ fn system_roots_refresh_and_explicit_false_overrides_environment() {
         true,
     );
     let pid = session.pid();
-    std::fs::write(&ca, CA_B).unwrap();
+    std::fs::write(&ca, b.certificate()).unwrap();
     read(&session, &b.url(), &[], true);
     read(&session, &a.url(), &[], false);
     let out = session
@@ -344,15 +417,17 @@ fn install_rejects_an_invalid_explicit_ca_before_network_or_daemon() {
 #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
 #[test]
 fn install_fetches_manifest_with_explicit_and_native_trust() {
-    let cert = include_str!("fixtures/tls/install.pem");
-    let proxy = TlsServer::with_response(
-        cert,
-        include_str!("fixtures/tls/install.key"),
+    let authority = TestAuthority::new();
+    let installer = authority.named(vec!["googlechromelabs.github.io".to_owned()], false);
+    let cert = authority.certificate_pem.clone();
+    let proxy = TlsServer::with_identity(
+        authority,
+        &installer,
         true,
         r#"{"channels":{"Stable":{"version":"0.0.0","downloads":{"chrome":[]}}}}"#,
     );
     let session = Session::new();
-    let ca = session.ca("installer.pem", cert);
+    let ca = session.ca("installer.pem", &cert);
     let url = format!("http://127.0.0.1:{}", proxy.port);
     for (args, trusted) in [
         (vec!["install"], false),
@@ -382,8 +457,8 @@ fn install_fetches_manifest_with_explicit_and_native_trust() {
 fn read_follows_ca_symlink_rotation() {
     let (a, b) = (TlsServer::a(), TlsServer::b());
     let session = Session::new();
-    let path_a = session.ca("a.pem", CA_A);
-    let path_b = session.ca("b.pem", CA_B);
+    let path_a = session.ca("a.pem", a.certificate());
+    let path_b = session.ca("b.pem", b.certificate());
     let selected = session.tmp.path().join("current.pem");
     std::os::unix::fs::symlink(&path_a, &selected).unwrap();
     read(
@@ -407,9 +482,9 @@ fn trust_option_transition_matrix_preserves_effective_roots() {
         for prior_native in [false, true] {
             for change in ["omit", "a", "b", "clear", "native-off", "native-on"] {
                 let mut session = Session::new();
-                let ca_a = session.ca("explicit-a.pem", CA_A);
-                let ca_b = session.ca("explicit-b.pem", CA_B);
-                session.system_bundle = Some(session.ca("native-b.pem", CA_B));
+                let ca_a = session.ca("explicit-a.pem", a.certificate());
+                let ca_b = session.ca("explicit-b.pem", b.certificate());
+                session.system_bundle = Some(session.ca("native-b.pem", b.certificate()));
                 read(
                     &session,
                     &a.url(),
@@ -459,10 +534,25 @@ fn trust_option_transition_matrix_preserves_effective_roots() {
 }
 
 #[test]
+fn tls_test_fixtures_do_not_store_private_keys() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("tls");
+
+    for name in ["install.key", "server-a.key", "server-b.key"] {
+        assert!(
+            !fixtures.join(name).exists(),
+            "TLS tests must generate private keys at runtime; found {name}"
+        );
+    }
+}
+
+#[test]
 fn rejected_ca_cert_keeps_the_saved_selection() {
     let a = TlsServer::a();
     let session = Session::new();
-    let ca = session.ca("ca.pem", CA_A);
+    let ca = session.ca("ca.pem", a.certificate());
     read(
         &session,
         &a.url(),
@@ -490,7 +580,7 @@ fn rejected_ca_cert_keeps_the_saved_selection() {
 fn batch_read_uses_session_trust_without_a_browser() {
     let a = TlsServer::a();
     let session = Session::new();
-    let ca = session.ca("ca.pem", CA_A);
+    let ca = session.ca("ca.pem", a.certificate());
     let url = a.url();
     let read_cmd = format!("read {url} --timeout 2000");
     for options in [vec!["--ca-cert", ca.to_str().unwrap()], vec![]] {
@@ -510,7 +600,7 @@ fn batch_read_uses_session_trust_without_a_browser() {
 fn stdin_batch_read_uses_session_trust_without_a_browser() {
     let a = TlsServer::a();
     let session = Session::new();
-    let ca = session.ca("ca.pem", CA_A);
+    let ca = session.ca("ca.pem", a.certificate());
     let input = serde_json::json!([["read", a.url(), "--timeout", "2000"]]).to_string();
     for options in [vec!["--ca-cert", ca.to_str().unwrap()], vec![]] {
         let mut child = session
@@ -542,7 +632,7 @@ fn stdin_batch_read_uses_session_trust_without_a_browser() {
 fn batch_close_clears_session_trust() {
     let a = TlsServer::a();
     let session = Session::new();
-    let ca = session.ca("ca.pem", CA_A);
+    let ca = session.ca("ca.pem", a.certificate());
     read(
         &session,
         &a.url(),

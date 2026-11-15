@@ -2,7 +2,7 @@
 
 ## Fixture provenance
 
-`fixtures/docs-baseline.json` is pinned to `efee3893d9080fcacb1aa6c9a21d13fbc6021f20`. The capture script reads git objects at that commit, not migrated application code or content. It preserves all 39 original `docs/src/app/**/page.mdx` files, their layouts, root metadata, `mdx-components.tsx`, `page-metadata.ts`, `page-titles.ts`, navigation, search implementation, and `mdx-to-markdown.ts`: 86 complete source files with SHA-256 hashes. Public resources and favicon are pinned by byte length and SHA-256.
+`fixtures/docs-baseline.json.gz` is the deterministic gzip representation of the baseline pinned to `efee3893d9080fcacb1aa6c9a21d13fbc6021f20`. The capture script reads git objects at that commit, not migrated application code or content. It preserves all 39 original `docs/src/app/**/page.mdx` files, their layouts, root metadata, `mdx-components.tsx`, `page-metadata.ts`, `page-titles.ts`, navigation, search implementation, and `mdx-to-markdown.ts`: 86 complete source files with SHA-256 hashes. Public resources and favicon are pinned by byte length and SHA-256. Tests decompress the fixture before checking its contents; `--check` compares the decompressed bytes with freshly generated JSON.
 
 Each page records its complete source hash, original H1 insertion position, metadata, heading levels/text/IDs, prose paragraphs, table cells, code examples, links, legacy Markdown and new Markdown derived from the original source. The H1 insertion position preserves imports before the title, as on `/diffing`.
 
@@ -14,7 +14,7 @@ Never regenerate fixtures from migrated output to accept a failing assertion. To
 node scripts/capture-docs-baseline.mjs --check
 ```
 
-To reproduce the same frozen baseline explicitly:
+To reproduce the same frozen baseline explicitly (the compressed fixture is regenerated deterministically):
 
 ```sh
 node scripts/capture-docs-baseline.mjs
@@ -53,7 +53,7 @@ Set `DOCS_EXPECT_NOINDEX=1` when testing an existing preview server. The capture
 
 ## Regression invariants
 
-Byte-for-byte MDX reconstruction, full Markdown equality, heading multiplicity and legacy search ranking were migration checks against the pinned commit. They were removed after the migration merged because any later content edit fails them. Remaining checks treat the baseline as a floor: every original line must still render in order, and new lines are allowed anywhere, including inside tables and code blocks. When a change intentionally rewrites original text, add a `from`/`to` entry for that page to `fixtures/docs-edits.json`, or the new size and SHA-256 for a changed public resource. Each `from` must still occur in the baseline, so stale entries fail. Never edit `docs-baseline.json` itself.
+Byte-for-byte MDX reconstruction, full Markdown equality, heading multiplicity and legacy search ranking were migration checks against the pinned commit. They were removed after the migration merged because any later content edit fails them. Remaining checks treat the baseline as a floor: every original line must still render in order, and new lines are allowed anywhere, including inside tables and code blocks. When a change intentionally rewrites original text, add a `from`/`to` entry for that page to `fixtures/docs-edits.json`, or the new size and SHA-256 for a changed public resource. Each `from` must still occur in the baseline, so stale entries fail. Never edit the compressed `docs-baseline.json.gz` fixture itself.
 
 - SSR prose/table/code content from the baseline, metadata, canonical URLs and Markdown alternates.
 - Every page's Markdown API, `.md`, negotiated Markdown, legacy query API and HEAD representations.

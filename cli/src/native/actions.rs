@@ -2916,14 +2916,6 @@ fn policy_actions_for_command(
     actions
 }
 
-/// Run one command against `state` and return its JSON response.
-///
-/// This is the single dispatcher both the CLI's daemon and an embedding host
-/// call: `cmd` is the same `{"id", "action", ...}` shape the daemon reads
-/// from its socket, and the returned [`Value`] is the same response shape a
-/// socket client receives. A host embedding the engine builds `state` with
-/// [`DaemonState::with_options`] and calls this directly, with no daemon
-/// process or socket involved.
 fn append_launch_policy_actions(
     actions: &mut Vec<String>,
     launch: &Value,
@@ -2945,6 +2937,14 @@ fn append_launch_policy_actions(
     }
 }
 
+/// Run one command against `state` and return its JSON response.
+///
+/// This is the single dispatcher both the CLI's daemon and an embedding host
+/// call: `cmd` is the same `{"id", "action", ...}` shape the daemon reads
+/// from its socket, and the returned [`Value`] is the same response shape a
+/// socket client receives. A host embedding the engine builds `state` with
+/// [`DaemonState::with_options`] and calls this directly, with no daemon
+/// process or socket involved.
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
     // Unlike normal auth login, no-navigation mode must never launch a
@@ -5956,6 +5956,9 @@ fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
 
 async fn handle_inspect(state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    if mgr.is_supervised_pipe() {
+        return Err("inspect is not supported for supervised inherited-pipe sessions".to_owned());
+    }
 
     // Shut down any existing inspect server so we always target the current page
     if let Some(server) = state.inspect_server.take() {

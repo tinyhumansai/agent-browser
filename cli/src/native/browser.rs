@@ -611,7 +611,7 @@ impl BrowserManager {
                 };
                 let ob = launch_obscura(&obscura_options).await?;
                 let url = ob.ws_url.clone();
-                (url, BrowserProcess::Obscura(ob))
+                (url, BrowserProcess::Obscura(ob), None)
             }
             _ => {
                 let chrome = tokio::task::spawn_blocking(move || {
@@ -1546,6 +1546,14 @@ impl BrowserManager {
             .or_else(|| self.ws_url.strip_prefix("wss://"))
             .unwrap_or(&self.ws_url);
         stripped.split('/').next().unwrap_or(stripped)
+    }
+
+    pub fn is_supervised_pipe(&self) -> bool {
+        self.client.is_pipe_transport()
+            && self
+                .browser_process
+                .as_ref()
+                .is_some_and(BrowserProcess::is_supervised_pipe)
     }
 
     pub fn active_target_id(&self) -> Result<&str, String> {
@@ -4823,13 +4831,15 @@ mod tests {
 
         // Keep sending requests so idle is never reached
         tokio::spawn(async move {
-            for i in 0u64.. {
+            let mut i = 0u64;
+            loop {
                 let _ = tx.send(cdp_event(
                     "Network.requestWillBeSent",
                     session,
                     json!({ "requestId": format!("r{}", i) }),
                 ));
                 sleep(Duration::from_millis(100)).await;
+                i = i.wrapping_add(1);
             }
         });
 

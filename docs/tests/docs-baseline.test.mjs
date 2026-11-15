@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, stat } from "node:fs/promises";
 import { test } from "node:test";
 import { navigation } from "../src/lib/docs-navigation.ts";
 import {
@@ -89,6 +89,36 @@ test("baseline pins all 39 routes and the original metadata, slugger and convert
     );
     assert.ok(page.content.length > 0, page.path);
   }
+});
+
+test("stored docs baseline fixture stays below the repository file-size limit", async () => {
+  const fixture = new URL("./fixtures/docs-baseline.json.gz", import.meta.url);
+  assert.ok(
+    (await stat(fixture)).size < 1_000_000,
+    "The checked-in docs baseline fixture must stay below 1 MB",
+  );
+});
+
+test("commands baseline allows the clarified comma behavior for --args", () => {
+  const commands = currentPages.find((page) => page.path === "/commands");
+  const line = "--args <args>            # Browser launch args (commas inside a value are kept)";
+  assert.ok(commands.modernMarkdown.includes(line));
+  assert.ok(commands.legacyMarkdown.includes(line));
+});
+
+test("CDP and configuration baselines allow the clarified comma behavior for launch args", () => {
+  const cdp = currentPages.find((page) => page.path === "/cdp-mode");
+  const configuration = currentPages.find(
+    (page) => page.path === "/configuration",
+  );
+  const cdpDescription =
+    "Browser launch args. Commas inside a value are kept.";
+  const configurationDescription =
+    "Browser launch arguments, separated by newlines or by commas before another flag. Commas inside a value are kept.";
+  assert.ok(cdp.modernMarkdown.includes(cdpDescription));
+  assert.ok(cdp.legacyMarkdown.includes(cdpDescription));
+  assert.ok(configuration.modernMarkdown.includes(configurationDescription));
+  assert.ok(configuration.legacyMarkdown.includes(configurationDescription));
 });
 
 test("WebMCP appears once in Features after CDP Mode in both navigation sources", async () => {

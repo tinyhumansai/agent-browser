@@ -36,6 +36,20 @@ type WsTx = Arc<
     >,
 >;
 
+fn bundled_root_store() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+fn bundled_tls_connector() -> Connector {
+    Connector::Rustls(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(bundled_root_store())
+            .with_no_client_auth(),
+    ))
+}
+
 /// Sessions whose events go to one private receiver instead of the broadcast.
 type PrivateSessions = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<CdpEvent>>>>;
 type PipeTx = Arc<Mutex<Option<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>>;
@@ -200,8 +214,8 @@ pub struct CdpClient {
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     keepalive_handle: Mutex<Option<JoinHandle<()>>>,
     private_sessions: PrivateSessions,
-    stealth: AtomicBool,
     method_taps: MethodTaps,
+    stealth: AtomicBool,
 }
 
 /// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
@@ -266,7 +280,7 @@ impl CdpClient {
             ..Default::default()
         };
 
-        Self::connect_request(request, ws_config, None).await
+        Self::connect_request(request, ws_config, Some(bundled_tls_connector())).await
     }
 
     /// Connect to Chromium's inherited NUL-framed DevTools pipe. The pipe
@@ -548,8 +562,8 @@ impl CdpClient {
             reader_handle: Mutex::new(Some(reader_handle)),
             keepalive_handle: Mutex::new(keepalive_handle),
             private_sessions,
-            stealth: AtomicBool::new(false),
             method_taps,
+            stealth: AtomicBool::new(false),
         })
     }
 
@@ -1017,6 +1031,33 @@ mod tests {
     const TEST_CERT_DER: &str = "MIIBPDCB46ADAgECAgkA9xwXmIhbzQIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgzMDA1NTU0NFoXDTM2MDgyNzA1NTU0NFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQdmPO0sXXFRmVn7+8MViXGom2rYy8aV3Oc0pNZhUmFGaPl4MRFzc1G0yaV/WRBPF/BUh2LGsXCvUsn7NqaYkFaMeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQC32oureGNAupABEmonQPAQBD7OdJjXmUxoVQNr0UB+6AIgb23GMwxTjwHyLG4tZcJST7r3cCW8K/Y+1h618j2f+Uw=";
     const TEST_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIVZST8Vhc5f3OW+4kF78f8o1nQCRwjW/Yo8CXQ35Y9uhRANCAARB2Y87SxdcVGZWfv7wxWJcaibatjLxpXc5zSk1mFSYUZo+XgxEXNzUbTJpX9ZEE8X8FSHYsaxcK9Syfs2ppiQV";
 
+    fn test_tls_server_config() -> (CertificateDer<'static>, Arc<rustls::ServerConfig>) {
+        let certificate = CertificateDer::from(
+            base64::engine::general_purpose::STANDARD
+                .decode(TEST_CERT_DER)
+                .unwrap(),
+        );
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            base64::engine::general_purpose::STANDARD
+                .decode(TEST_KEY_DER)
+                .unwrap(),
+        ));
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate.clone()], key)
+                .unwrap(),
+        );
+        (certificate, server_config)
+    }
+
+    #[test]
+    fn default_tls_connector_uses_the_direct_mozilla_root_set() {
+        let roots = bundled_root_store();
+        assert_eq!(roots.roots.as_slice(), webpki_roots::TLS_SERVER_ROOTS);
+        assert!(matches!(bundled_tls_connector(), Connector::Rustls(_)));
+    }
+
     #[test]
     fn repairs_only_unpaired_surrogate_escapes() {
         let msg = r#"{"id":1,"result":{"high":"\ud800","low":"\udfff","pair":"\ud83d\ude00","escaped":"\\ud800","text":"café 中文"}}"#;
@@ -1383,22 +1424,7 @@ mod tests {
 
     #[tokio::test]
     async fn rustls_close_forces_underlying_tcp_eof() {
-        let certificate = CertificateDer::from(
-            base64::engine::general_purpose::STANDARD
-                .decode(TEST_CERT_DER)
-                .unwrap(),
-        );
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            base64::engine::general_purpose::STANDARD
-                .decode(TEST_KEY_DER)
-                .unwrap(),
-        ));
-        let server_config = Arc::new(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(vec![certificate.clone()], key)
-                .unwrap(),
-        );
+        let (certificate, server_config) = test_tls_server_config();
 
         let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1445,6 +1471,37 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn bundled_tls_connector_rejects_an_untrusted_certificate() {
+        let (_, server_config) = test_tls_server_config();
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let connection = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(connection, stream);
+            let mut byte = [0u8; 1];
+            assert!(tls.read(&mut byte).is_err());
+        });
+
+        let request = format!("wss://127.0.0.1:{port}")
+            .into_client_request()
+            .unwrap();
+        let config = WebSocketConfig {
+            max_message_size: None,
+            max_frame_size: None,
+            ..Default::default()
+        };
+        let result =
+            CdpClient::connect_request(request, config, Some(bundled_tls_connector())).await;
+
+        assert!(result.is_err(), "self-signed certificate must be rejected");
+        server.join().unwrap();
+    }
+
     #[test]
     fn normalizes_only_root_websocket_queries() {
         assert_eq!(
@@ -1474,6 +1531,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn root_websocket_url_with_query_sends_slash_request_target() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

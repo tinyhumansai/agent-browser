@@ -582,3 +582,6 @@ That pulls in:
 - `references/proxy-support.md`: proxy configuration and CA certificates for HTTPS interception proxies
 - `references/webgpu.md` — screenshots/video of WebGPU pages (three.js, Babylon.js), Linux/CI setup
 - `templates/*` — starter shell scripts for auth, capture, form automation
+# Embedding the native engine
+
+Embedding hosts can create a `DaemonState` with `DaemonState::with_options` and call `execute_command` with daemon-shaped JSON commands. Use per-session `StateOptions` instead of shared `AGENT_BROWSER_*` environment variables when hosting multiple sessions. For locally launched Chrome, configure a trusted `BrowserSpawnSupervisor`; enable `require_browser_spawn_supervisor` when an unsupervised launch must be rejected. The supervisor owns the process tree and inherited CDP pipes, and must enforce the requested native isolation. Pipe transport does not itself isolate browser networking. See the [native mode documentation](https://agent-browser.dev/docs/native-mode) for platform pipe requirements and unsupported routes.

@@ -54,6 +54,8 @@ mod tls;
 mod upgrade;
 mod validation;
 
+#[cfg(test)]
+pub(crate) use cli::attach_obscura_proxy_bypass;
 pub use native::actions::{execute_command, DaemonState, StateOptions};
 pub use native::cdp::process::{
     BrowserChildProcess, BrowserControlPipe, BrowserControlPipeControl, BrowserControlTransport,

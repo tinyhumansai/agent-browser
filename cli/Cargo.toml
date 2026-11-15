@@ -17,15 +17,14 @@ dirs = "5.0"
 base64 = "0.22"
 getrandom = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "process"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "__rustls-tls"] }
 rustls = { version = "0.23", default-features = false }
 # PEM decoding for --ca-cert. Used instead of rustls-pemfile (unmaintained,
 # RUSTSEC-2025-0134): rustls already depends on rustls-pki-types, and its
 # `PemObject::pem_reader_iter` covers the same preamble-skipping PEM parse.
 rustls-pki-types = { version = "1", features = ["std"] }
 rustls-native-certs = "0.8"
-rustls-pemfile = "2"
-webpki-roots = "0.26"
+webpki-roots = "1.0.10"
 futures-util = "0.3"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
@@ -56,6 +55,7 @@ windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_F
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = "0.14"
 
 [build-dependencies]
 serde = { version = "1.0", features = ["derive"] }
