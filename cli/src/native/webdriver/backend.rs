@@ -4,7 +4,7 @@ use serde_json::Value;
 /// Abstract backend for browser automation. CDP (Chromium) and WebDriver
 /// (Safari/iOS) share this interface so actions.rs can remain backend-agnostic
 /// in the future.
-#[expect(
+#[allow(
     clippy::double_must_use,
     reason = "async_trait emits unmessaged must_use attributes for its boxed futures"
 )]

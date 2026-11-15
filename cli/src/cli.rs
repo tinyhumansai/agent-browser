@@ -2177,7 +2177,7 @@ fn configure_local_launch(flags: &Flags, command: &serde_json::Value) {
         if let Some(ref engine) = flags.engine {
             launch_cmd["engine"] = json!(engine);
         }
-        attach_obscura_proxy_bypass(&mut launch_cmd, &flags);
+        attach_obscura_proxy_bypass(&mut launch_cmd, flags);
 
         match send_command(launch_cmd, &flags.session) {
             Ok(resp) if !resp.success => {
